@@ -339,10 +339,13 @@ pub struct WriteResult {
 
 impl WriteResult {
     fn from_error(e: &str) -> WriteResult {
+        // 注意要把它**解析成 payload**：classify 靠 payload 里的 error 字段
+        // 把"超时"和"连接被断"分开，光塞进 text 是看不到的。
+        let text = format!("{{\"error\":{}}}", Json::str(e).to_compact());
         WriteResult {
-            payload: Json::Obj(Vec::new()),
+            payload: json::parse_or_empty(&text),
             status: 0,
-            text: format!("{{\"error\":{}}}", Json::str(e).to_compact()),
+            text,
             ms: 0.0,
         }
     }

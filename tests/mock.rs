@@ -151,6 +151,12 @@ fn serve(
     t0: Instant,
 ) {
     // keep-alive：一个连接上可能连着来好几条请求（客户端就是这么复用的）
+    //
+    // 必须显式设回阻塞：监听套接字是非阻塞的（accept 循环要轮询 stop 标志），
+    // 而 **Windows 上 accept() 出来的套接字会继承监听套接字的非阻塞状态**
+    //（POSIX 不会）。继承了的话，serve 线程读完第一条请求就会立刻拿到 WouldBlock,
+    // 于是每条连接只服务一条请求 —— 客户端第二次复用连接时就会撞上死连接。
+    let _ = stream.set_nonblocking(false);
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let mut served = 0usize;
     while let Some(req) = read_request(&mut stream) {
@@ -304,9 +310,19 @@ fn read_request(stream: &mut TcpStream) -> Option<ParsedRequest> {
             break pos;
         }
         match stream.read(&mut tmp) {
-            Ok(0) => return None,
+            Ok(0) => {
+                eprintln!("[mock] 对端关闭了连接（EOF）");
+                return None;
+            }
             Ok(n) => buf.extend_from_slice(&tmp[..n]),
-            Err(_) => return None,
+            Err(e) if is_would_block(&e) => {
+                eprintln!("[mock] 读返回 WouldBlock（套接字是非阻塞的？）");
+                return None;
+            }
+            Err(e) => {
+                eprintln!("[mock] 读错误: {e}");
+                return None;
+            }
         }
     };
     let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
@@ -338,6 +354,13 @@ fn read_request(stream: &mut TcpStream) -> Option<ParsedRequest> {
     }
     let text = String::from_utf8_lossy(&body[..content_length.min(body.len())]).into_owned();
     Some((method, path, parse_form(&text), cookie))
+}
+
+fn is_would_block(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
 }
 
 fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
