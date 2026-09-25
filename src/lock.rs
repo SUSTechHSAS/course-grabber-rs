@@ -172,7 +172,12 @@ mod tests {
     fn rejects_bogus_pids() {
         assert!(!pid_is_our_instance(0));
         assert!(!pid_is_our_instance(-1));
-        // 一个几乎不可能存在的 PID
+        // 超出 pid_t 能表示的范围
+        assert!(!pid_is_our_instance(i32::MAX as i64 + 1));
+        // "一个几乎不可能存在的 PID"：unix 上能确认它已经死了（ESRCH）；
+        // Windows 上没有便宜的探活手段，我们保守地当成"可能活着"（宁可让用户
+        // 加 --force），所以这条只在 unix 上断言。
+        #[cfg(unix)]
         assert!(!pid_is_our_instance(0x7fff_fffe));
     }
 
@@ -192,10 +197,13 @@ mod tests {
         drop(lock);
         assert!(!path.exists(), "drop 之后锁文件应当被删掉");
 
-        // 别人的锁（一个几乎不可能存在的 PID）不该拦我们
-        std::fs::write(&path, "2147483646").unwrap();
-        assert!(InstanceLock::acquire(&path, false).is_some());
-        let _ = std::fs::remove_file(&path);
+        // 别人的锁（一个已经死掉的 PID）不该拦我们 —— 同样只在能探活的平台上成立
+        #[cfg(unix)]
+        {
+            std::fs::write(&path, "2147483646").unwrap();
+            assert!(InstanceLock::acquire(&path, false).is_some());
+            let _ = std::fs::remove_file(&path);
+        }
         let _ = std::fs::remove_dir(&dir);
     }
 }

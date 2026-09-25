@@ -152,7 +152,9 @@ fn serve(
 ) {
     // keep-alive：一个连接上可能连着来好几条请求（客户端就是这么复用的）
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let mut served = 0usize;
     while let Some(req) = read_request(&mut stream) {
+        served += 1;
         let (method, path, form, cookie) = req;
         let path_only = path.split('?').next().unwrap_or(&path).to_string();
         calls.lock().unwrap().push(Call {
@@ -214,6 +216,8 @@ fn serve(
             &cookies,
         );
     }
+    // 这条连接结束了：留一句，自检失败时能看出"是服务端先关的"还是客户端断的
+    eprintln!("[mock] 连接关闭（这条连接服务了 {served} 条请求）");
 }
 
 fn json(s: &str) -> String {

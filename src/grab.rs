@@ -241,14 +241,17 @@ pub fn classify(payload: &Json, status: u16, text: &str) -> (Verdict, String) {
         );
     }
     if status == 0 {
-        return (
-            Verdict::Overload,
-            if msg.is_empty() {
-                "没有拿到响应（超时/连接被断）".to_string()
-            } else {
-                msg
-            },
-        );
+        // 我们自己在写请求失败时把原始错误塞进了 {"error": "..."}，这里带上它 ——
+        // "超时"和"连接被断"是两种完全不同的故障，日志里得能分清。
+        let detail = payload.text("error");
+        let out = if !msg.is_empty() {
+            msg
+        } else if detail.is_empty() {
+            "没有拿到响应（超时/连接被断）".to_string()
+        } else {
+            format!("没有拿到响应: {detail}")
+        };
+        return (Verdict::Overload, out);
     }
     let low = text.trim_start().to_lowercase();
     if falsy(payload) && low.starts_with('<') {
