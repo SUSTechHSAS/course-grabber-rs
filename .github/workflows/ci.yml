@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # 识别库是本仓库的 path 依赖（模型编在它里面），构建前必须 clone 到同级目录
+  CAPTCHA_REPO: https://github.com/SUSTechHSAS/click-captcha-matcher-rs.git
+
+jobs:
+  test:
+    name: 自检 (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 取识别库（path 依赖，必须就位）
+        shell: bash
+        run: git clone --depth 1 "$CAPTCHA_REPO" "${{ github.workspace }}/../click-captcha-matcher-rs"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: 格式与 lint
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets -- -D warnings
+        shell: bash
+
+      # 自检不需要网络、不需要账号、不需要真图：假学校服务端跑在 127.0.0.1 上
+      - name: 自检
+        run: cargo test --locked
+        shell: bash
+
+  build-smoke:
+    name: 打包冒烟（真实构建 + 产物自检）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 取识别库
+        run: git clone --depth 1 "$CAPTCHA_REPO" "${{ github.workspace }}/../click-captcha-matcher-rs"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: 打包
+        run: ./packaging/build.sh
+
+      - name: 产物自检（不需要网络、不需要账号）
+        shell: bash
+        run: |
+          set -e
+          cd dist/course-grabber-linux-x64
+          ./course-grabber --version
+          cp config.example.json config.json
+          # 不要把输出直接管给 head —— 那会让进程吃到 SIGPIPE（虽然我们已经把它设回默认，
+          # 进程会安静退出，但 CI 里没必要制造这种边界情况）
+          out=$(./course-grabber --offline)
+          printf '%s\n' "$out" | tail -5
+          printf '%s\n' "$out" | grep -q "operationType"
+
+      - name: 体积检查（识别模型必须在里面，而整包必须足够小）
+        shell: bash
+        run: |
+          set -e
+          size=$(stat -c %s dist/course-grabber-linux-x64/course-grabber)
+          echo "可执行文件 $((size / 1024)) KB"
+          # 下界：识别模型 124KB + 推理代码，小于 500KB 说明模型没编进去
+          [ "$size" -gt 500000 ] || { echo "✗ 太小了，识别模型大概没编进去"; exit 1; }
+          # 上界：这是本项目的核心卖点，别悄悄涨回去
+          [ "$size" -lt 2000000 ] || { echo "✗ 超过 2MB 了，检查是不是拉进了新依赖"; exit 1; }

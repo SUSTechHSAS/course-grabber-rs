@@ -1,0 +1,16 @@
+# 本地配置与凭据：绝对不要提交
+config.json
+credentials.json
+*.local.json
+
+# 运行产物（单实例锁）
+.course-grabber.lock
+
+# 实验记录（可能含真实账号/会话信息）
+*.log
+
+# 打包产物
+dist/
+
+# Rust
+/target

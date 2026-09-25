@@ -1,0 +1,9 @@
+# 体积裁剪。与 click-captcha-matcher-rs 里那份同样的理由：
+# panic = abort 之后展开表（unwind tables）是纯负担，build-id 也没人看。
+# macOS 目标不能用 force-unwind-tables=no（需要展开表），保持默认。
+[target.'cfg(target_os = "linux")']
+rustflags = ["-C", "force-unwind-tables=no", "-C", "link-arg=-Wl,--build-id=none"]
+
+# 体积对比时用得上：链接前打印各段大小（要求链接器支持 --print-memory-usage）
+# [target.'cfg(target_os = "linux")']
+# rustflags = ["-C", "link-arg=-Wl,--print-memory-usage"]

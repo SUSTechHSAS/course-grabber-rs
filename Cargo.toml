@@ -1,0 +1,54 @@
+[package]
+name = "course-grabber"
+version = "1.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+description = "教务系统抢课：放课窗口精准首发 + 持续捡漏（含点选验证码识别）"
+publish = false
+
+[lib]
+name = "course_grabber"
+# 模块文档里有缩进的说明块（协议流程、接口清单），那些不是 Rust 代码。
+# 关掉 doctest，别让 rustdoc 去编译它们。
+doctest = false
+
+# 唯一的产物：一个自带一切的静态可执行文件。
+# 验证码识别是 path 依赖 ../click-captcha-matcher-rs（模型编在那个库里），
+# 所以不再需要动态库、python/ 目录或模型文件 —— 一个文件就是全部。
+[[bin]]
+name = "course-grabber"
+path = "src/main.rs"
+
+[dependencies]
+# 识别库：编译进来的一个普通 Rust 依赖（模型也编在里面）。
+# features = ["std"] 让它用我们自己的运行期（不是 no_std 那套自带分配器），
+# 这样 `cargo test` 也能正常构建 —— 详见那个 crate 里对 std feature 的说明。
+ccm = { package = "click-captcha-matcher", path = "../click-captcha-matcher-rs", features = ["std"] }
+# 只用它做四件标准库没有的事：kill(pid,0) 探活、setsockopt、sigaction、SIGPIPE。
+libc = { version = "0.2", default-features = false, features = ["std"] }
+
+[profile.release]
+# 全局按"小"优化（实测比 opt-level 3 少 117 KB），
+# 但识别推理单独抬回 3 —— 那几 KB 不值得换推理变慢。
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+debug = false
+incremental = false
+# 溢出检查默认关；显式关掉是为了不受将来默认值变化影响（放课窗口里 panic 等于报废）
+overflow-checks = false
+
+[profile.release.package.click-captcha-matcher]
+opt-level = 3
+
+# dev 保持默认的 unwind：`cargo test` 的测试框架要展开 panic，而且集成测试里
+# 被依赖的 lib 必须和测试框架用同一种 panic 策略 —— dev 设 panic="abort" 会把
+# 集成测试的链接搞坏（undefined symbol: core::...）。release 里 panic=abort 没问题，
+# 因为那里不构建测试目标。
+#
+# （识别库本身是 no_std 的，但它带 std feature，所以两个 profile 都编得过。）
+[profile.dev]
+opt-level = 0
