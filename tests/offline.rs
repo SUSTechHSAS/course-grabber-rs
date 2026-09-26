@@ -24,7 +24,7 @@ use course_grabber::grab::{self, Group, School, State, Verdict};
 use course_grabber::json;
 use course_grabber::pacer::WritePacer;
 use course_grabber::timeutil;
-use mock::{LoginReply, Mock, Mode};
+use mock::{LoginReply, Mock, Mode, AUTH_BACK_AFTER};
 
 const TEST_CONFIG: &str = include_str!("config.test.json");
 const KEYS: [&str; 3] = ["this", "password", "is"];
@@ -536,6 +536,96 @@ fn init_outage_keeps_firing() {
     assert!(
         writes >= 2,
         "停机期间仍在写（不是安静地轮询）：只发了 {writes} 发 @ {stamps:?}"
+    );
+    mock.close();
+}
+
+/// 2026-09-26 20:00 的真实事故：放课瞬间学校把选课子系统推倒重排，会话被作废，
+/// 认证接口同时返回 `#E2140600091 认证失败`。
+///
+/// 旧版在 `Verdict::Expired` 里只调用**一次** `recover()`，失败就 `return` ——
+/// 那天真实日志是 20:00:00 放课、**20:00:04 进程就退出了**，90 秒的窗口扔掉 86 秒，
+/// 而学校 20:00:20 左右就能重新登录（09-25 那晚就是这样）。09-25 / 09-26 连续两晚
+/// 都是这个死法，所以这条路径必须钉死。
+///
+/// 断言的是"恢复之后还在抢"，而不只是"日志好看"：旧代码在 `AUTH_BACK_AFTER`
+/// 之前就返回了，一条写请求都不会落在停机之后。
+#[test]
+fn auth_outage_at_the_window_does_not_abandon_the_run() {
+    let mock = Mock::start(Mode::KickThenAuthBack, vec![LoginReply::Ok, LoginReply::Ok]);
+    let ep = endpoints(mock.port);
+    let school = School::new(
+        Arc::clone(&ep),
+        "tok",
+        "JSESSIONID=x",
+        "http://x/y.do?token=tok",
+        4.0,
+        // 故意只给 1 次重登录配额：窗口里必须能突破它（relax_relogin_limit），
+        // 但真正收口的是墙钟（--window），不是次数。
+        Some(relogin_manager(&ep, 1, 2)),
+    );
+    school.set_code(STUDENT);
+    school.set_pacer(Arc::new(WritePacer::new(3, 1.0, 0.15, 0.10)));
+
+    let args = match cli::parse(
+        [
+            "--url",
+            "http://x/y.do?token=t",
+            "--live",
+            "--window",
+            "11.0",
+            "--burst",
+            "0.2",
+            "--interval",
+            "1.0",
+            "--slow",
+            "1.0",
+        ]
+        .iter()
+        .map(|s| s.to_string()),
+    )
+    .unwrap()
+    {
+        cli::Parsed::Run(a) => *a,
+        _ => unreachable!(),
+    };
+
+    let groups = vec![Group {
+        name: "星期一-3-5".to_string(),
+        members: vec![
+            grab::Target::new("000000000000000000000001", "A班"),
+            grab::Target::new("000000000000000000000002", "B班"),
+        ],
+    }];
+    let t_start = timeutil::unix_now();
+    grab::retry_loop(
+        Arc::clone(&school),
+        STUDENT.to_string(),
+        "BATCH1".to_string(),
+        "01".to_string(),
+        groups,
+        State::new(),
+        Arc::new(args),
+        t_start,
+        0.35,
+        grab::Gate::new(),
+    );
+    let elapsed = timeutil::unix_now() - t_start;
+
+    let stamps = mock.writes.lock().unwrap().clone();
+    let after_back = stamps.iter().filter(|t| **t >= AUTH_BACK_AFTER).count();
+    assert!(
+        after_back >= 1,
+        "学校恢复之后必须还在抢，而不是提前退出（窗口 11.0s，实际跑了 {elapsed:.1}s）：\
+         写请求时间轴 {stamps:?}（停机 {AUTH_BACK_AFTER}s）"
+    );
+    assert!(
+        elapsed >= AUTH_BACK_AFTER,
+        "整个任务在停机结束前就退出了：只跑了 {elapsed:.1}s"
+    );
+    assert!(
+        !mock.calls_to("login.do").is_empty(),
+        "重排数据期间至少要真的试过重登录"
     );
     mock.close();
 }

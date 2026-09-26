@@ -63,7 +63,18 @@ pub enum Mode {
     ByCategory,
     /// 有批次，但目录是空的 —— 不是选课时间时就是这样
     EmptyCatalog,
+    /// 放课瞬间学校把整个选课子系统推倒重排：会话作废（读写一律回"身份不一致"），
+    /// 认证接口同时返回 `#E2140600091 认证失败`，`AUTH_BACK_AFTER` 秒后才恢复。
+    /// 2026-09-25 和 09-26 两次 20:00 实战都是这个状态。
+    KickThenAuthBack,
 }
+
+/// `Mode::KickThenAuthBack` 的停机时长（秒）：这段时间内认证服务不可用。
+///
+/// 取 4 秒是为了**避开每一步的固定时刻**，让断言不靠运气：重试循环的第一轮在
+/// `--interval`（测试里是 1.0s）之后出手，`session_dead` 再花 0.4+0.8 秒复核，
+/// 加上 0.5/1.0/2.0 的重登录退避，恢复点落在 4.0s 前后都有近一秒的余量。
+pub const AUTH_BACK_AFTER: f64 = 4.0;
 
 /// 一份课程目录响应：一门「测试课程」，三个教学班（其中一个上课地点没写星期节次）。
 const CATALOG_JSON: &str = r#"{"code":"1","data":{"campus":"01"},"dataList":[
@@ -200,7 +211,14 @@ fn serve(
         let body: String = if method == "POST" && path_only.ends_with("vcode.do") {
             json(r#"{"code":"1","data":{"token":"vt-1"}}"#)
         } else if method == "POST" && path_only.ends_with("login.do") {
-            let step = script.lock().unwrap().pop_front().unwrap_or(LoginReply::Ok);
+            // 重排数据期间认证接口自己也是坏的 —— 这条**不消耗**重登录次数配额
+            let step = if mode == Mode::KickThenAuthBack
+                && t0.elapsed().as_secs_f64() < AUTH_BACK_AFTER
+            {
+                LoginReply::Code("#E2140600091", "认证失败")
+            } else {
+                script.lock().unwrap().pop_front().unwrap_or(LoginReply::Ok)
+            };
             match step {
                 LoginReply::Ok => {
                     cookies.push("JSESSIONID=S1; Path=/".to_string());
@@ -290,6 +308,12 @@ fn serve(
             }
         } else if mode == Mode::GuardSession && !cookie.contains("JSESSIONID=S1") {
             json(r#"{"code":"302","msg":"未登录用户"}"#)
+        } else if mode == Mode::KickThenAuthBack && t0.elapsed().as_secs_f64() < AUTH_BACK_AFTER {
+            // 会话被作废期间：读写一律这个回复（写请求照旧记账）
+            if method == "POST" && path_only.ends_with("volunteer.do") {
+                writes.lock().unwrap().push(t0.elapsed().as_secs_f64());
+            }
+            json(r#"{"code":"0","msg":"请求数据与登录者身份不一致，非法请求。"}"#)
         } else if method == "POST" && path_only.ends_with("volunteer.do") {
             // 写请求在任何模式下都要记账（自检要能断言"发了几发"）
             writes.lock().unwrap().push(t0.elapsed().as_secs_f64());

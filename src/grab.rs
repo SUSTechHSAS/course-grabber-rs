@@ -463,6 +463,15 @@ impl School {
             .unwrap_or_default()
     }
 
+    /// 放宽自动重登录的次数上限（放课窗口里用：窗口内不因为"试了几次"就放弃）。
+    pub fn relax_relogin_limit(&self, at_least: i64) {
+        if let Some(a) = self.auth.as_ref() {
+            a.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .relax_limit(at_least);
+        }
+    }
+
     /// 只读接口确认会话是否有效。返回 (是否有效, 原始返回)。
     pub fn probe(&self) -> (bool, Json) {
         let path = format!(
@@ -1313,6 +1322,10 @@ struct SniperJob {
     wire: Vec<u8>,
     tc_id: String,
     fire_at: f64,
+    /// 全局的放课时刻。`fire_at` 是这一发自己的计划时刻（= 放课时刻 + i×stagger），
+    /// 日志里两个偏移要分开报 —— 只报相对自己的那个，会把"错开 100ms"读成
+    /// "晚了 161ms 才出手"（2026-09-26 复盘时就差点看错）。
+    ref_at: f64,
     state: Arc<State>,
     out: mpsc::Sender<Shot>,
     idx: usize,
@@ -1330,6 +1343,7 @@ fn sniper(job: SniperJob) {
         wire,
         tc_id,
         fire_at,
+        ref_at,
         state,
         out,
         idx,
@@ -1424,8 +1438,9 @@ fn sniper(job: SniperJob) {
             // 耗时用单调钟；"相对出手时刻"要用墙钟（fire_at 是墙钟）—— 两者不能混算
             let ms = (timeutil::mono_now() - t0_mono) * 1000.0;
             info(&format!(
-                "  首发#{idx} 建连于 T{:+.2}s，写出于 T{:+.1}ms",
-                t_conn - fire_at,
+                "  首发#{idx} 建连于 T{:+.2}s，写出于 T{:+.1}ms（比自己的计划时刻晚 {:.0}ms）",
+                t_conn - ref_at,
+                (t0_unix - ref_at) * 1000.0,
                 (t0_unix - fire_at) * 1000.0
             ));
             finish(Shot {
@@ -1453,6 +1468,14 @@ fn sniper(job: SniperJob) {
 // ==========================================================================
 // 复核与重试
 // ==========================================================================
+
+/// 放课窗口内的自动重登录上限：**窗口只按墙钟（`--window`）收口，不看次数。**
+///
+/// `--relogin-max` 的原意是"凭据错时别把账号刷到被锁"，但真正的凭据错误走的是
+/// `BadCredentials` 熔断，不受这里影响；而 2026-09-25 / 09-26 连续两晚的死法都是
+/// "试了几次就收工、把整个窗口扔掉"。所以窗口里把它放到实际上不设限。
+/// 账户安全由两道更硬的约束兜着：退避封顶 8 秒（不是猛冲），以及窗口本身的时长。
+pub const WINDOW_RELOGIN_BUDGET: i64 = 1000;
 
 /// 确认会话是不是真的死了。
 ///
@@ -1968,23 +1991,70 @@ pub fn retry_loop(
                             pace = (pace * 2.0).min(1.5);
                             continue;
                         }
-                        // 真死了：以前这里直接终止整个任务（2026-09-24 就是死在这一步，
-                        // 比放课早 350ms 自杀）。现在先自动登回来 —— 被限流踢掉是常态，
-                        // 而放课窗口只有几十秒，等人来救等于放弃。
-                        if school.auth.is_some() && school.recover("被学校踢掉会话") {
-                            pace = args.interval; // 新会话，节奏从头开始
-                            continue;
+                        // 真死了：这里决定"救不救得回来"，而**绝不能**因此放弃窗口。
+                        //
+                        // 2026-09-25 和 09-26 两次 20:00 实战都死在这一段：旧版只调用
+                        // **一次** recover()，失败就 return —— 整个 90 秒窗口在第 4 秒
+                        // 被放弃（09-26 的日志：20:00:04.355 最后一次登录被拒，进程随即退出，
+                        // 而学校 20:00:20 左右就能重新登录了）。
+                        //
+                        // 学校在放课瞬间是把整个选课子系统推倒重排：会话全作废、认证接口
+                        // 短暂返回 #E2140600091（这条不消耗重登录配额）。所以现在的做法是
+                        // **一直试到窗口结束**：这段时间不写（写出去也必被拒），只做一件事
+                        // —— 登回来，然后立刻接着抢。
+                        let mut fatal_why = String::new();
+                        if school.auth.is_some() {
+                            // 窗口里不该因为"试了几次"就停手；墙钟（deadline）才是收口条件。
+                            school.relax_relogin_limit(WINDOW_RELOGIN_BUDGET);
+                            let mut backoff = 0.5f64;
+                            let mut got = false;
+                            while timeutil::unix_now() < deadline
+                                && !state.stopped()
+                                && !state.is_done()
+                            {
+                                if school.recover("被学校踢掉会话（放课瞬间，会一直试到窗口结束）")
+                                {
+                                    got = true;
+                                    break;
+                                }
+                                // 只有"凭据本身有问题"才值得停手。**次数上限不算** ——
+                                // `--relogin-max` 的原意是凭据错时别把账号刷到被锁，
+                                // 而窗口里每一次失败通常只是学校在重排数据或验证码没认出来，
+                                // 停手等于把整个窗口扔掉。收口只认墙钟。
+                                fatal_why = school.auth_fatal().unwrap_or_default();
+                                if !fatal_why.is_empty() {
+                                    break;
+                                }
+                                let left = (deadline - timeutil::unix_now()).max(0.0);
+                                info(&format!(
+                                    "  还没登回来，{:.1}s 后再试（窗口还剩 {:.0}s）",
+                                    backoff.min(left),
+                                    left
+                                ));
+                                interruptible_sleep(backoff, Some(&state), 0.2);
+                                // 退避封顶 8 秒：既要快（学校约 20 秒就恢复），
+                                // 也不能在 600 秒的窗口里把登录接口打成风控目标 ——
+                                // 0.5/1/2/4/8 五次累计 15.5 秒就跨过那次真实停机了。
+                                backoff = (backoff * 2.0).min(8.0);
+                            }
+                            if got {
+                                info("  ✓ 会话已登回来，立刻接着抢");
+                                pace = args.interval; // 新会话，节奏从头开始
+                                continue;
+                            }
                         }
                         log::blank();
                         log::rule('!');
                         log::log(
-                            "  ✗ 会话确实已失效（多半是被限流踢掉，或学校在放课时重排了数据）",
+                            "  ✗ 直到窗口结束都没能把会话登回来（多半是被限流踢掉，或学校在放课时重排了数据）",
                         );
                         if school.auth.is_some() {
                             let why = school.auth_why_not();
                             log::log(&format!(
                                 "  自动重登录也没能救回来：{}",
-                                if why.is_empty() {
+                                if !fatal_why.is_empty() {
+                                    fatal_why
+                                } else if why.is_empty() {
                                     "见上面 [auth] 日志".to_string()
                                 } else {
                                     why
@@ -2917,6 +2987,13 @@ pub fn main(mut args: Args) -> Result<u8, String> {
     ));
     school.set_pacer(Arc::clone(&pacer));
     let end_at = fire_at + args.window;
+    // 窗口里不收口在"登了几次"上，只收口在墙钟（`--window`）上。
+    //
+    // 学校的放课瞬间会**连续**拒绝登录（`#E2140600091 认证失败`，约二十秒），
+    // 而那正是最需要登回来的时候。默认的 `--relogin-max 4` 会让脚本正当地
+    // "放弃并喊人" —— 但窗口只剩几十秒，喊人等于是放弃。
+    // 真·凭据错误走的是另一条路（`BadCredentials` 直接熔断），不受这里影响。
+    school.relax_relogin_limit(WINDOW_RELOGIN_BUDGET);
     info(&format!(
         "本次窗口：{} → {}（--window {:.0}s），之后自动收尾退出；中途 Ctrl-C 可随时手动停",
         timeutil::civil(fire_at).hms(),
@@ -2993,6 +3070,7 @@ pub fn main(mut args: Args) -> Result<u8, String> {
                 wire: wire.clone(),
                 tc_id: tc.clone(),
                 fire_at: *at,
+                ref_at: fire_at,
                 state: Arc::clone(&state),
                 out: tx.clone(),
                 idx: i,

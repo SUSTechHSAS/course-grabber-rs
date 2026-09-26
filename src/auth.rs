@@ -737,6 +737,19 @@ impl ReloginManager {
         self.fatal.is_none() && self.attempts < self.max_logins
     }
 
+    /// 放宽"本次运行最多登录几次"的上限（只升不降）。
+    ///
+    /// 这个上限存在的理由是**防止凭据错误时把账号刷到被锁**。但放课窗口里
+    /// 每一次登录失败通常只是验证码没认出来，不该因此放弃整个窗口 ——
+    /// 2026-09-26 20:00 的复盘：会话在 T+0.2s 被学校作废，脚本试了两次登录
+    /// 就在 T+4.4s 退出了，90 秒的窗口扔掉 86 秒。
+    ///
+    /// 真·凭据错误是另一条路（`AuthError::BadCredentials` 会写 `fatal` 熔断），
+    /// 放宽这个计数不会把密码错的账号刷到被锁。调用方仍然要用墙钟自己收口。
+    pub fn relax_limit(&mut self, at_least: i64) {
+        self.max_logins = self.max_logins.max(at_least);
+    }
+
     pub fn why_not(&self) -> String {
         if let Some(f) = &self.fatal {
             return f.clone();
