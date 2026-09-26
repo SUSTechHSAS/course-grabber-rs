@@ -80,6 +80,34 @@ fn url_for(port: u16) -> String {
     format!("http://127.0.0.1:{port}/api/*default/grablessons.do?token=testtoken")
 }
 
+/// 配置界面（`course-grabber tui`）的接口约定。
+///
+/// 真正的界面要在终端里人工点，这里只钉三条不依赖 pty 的硬约定：帮助随时可用、
+/// 没有终端时说得清楚地拒绝（而不是把控制序列喷进管道）、**没按保存就不碰磁盘**。
+#[test]
+fn tui_help_and_no_terminal_refusal() {
+    let (code, out) = run_binary(&std::env::temp_dir(), &["tui", "--help"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("交互式配置编辑器"), "{out}");
+    assert!(out.contains("--config"), "{out}");
+
+    let dir = std::env::temp_dir().join(format!("cg-tui-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // 这里的 stdin/stdout 是管道，界面进不去 —— 退出码 2 + 人话
+    let (code, out) = run_binary(&dir, &["tui", "--config", "config.json"]);
+    assert_eq!(code, 2, "{out}");
+    #[cfg(unix)]
+    assert!(out.contains("需要一个真正的终端"), "{out}");
+    #[cfg(not(unix))]
+    assert!(out.contains("只在 Linux/macOS"), "{out}");
+    // 一条都没写：模板是在内存里生成的，只有按了 s 才落盘
+    assert!(!dir.join("config.json").exists(), "没保存就不该动磁盘");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn cli_preflight_is_read_only() {
     let mock = Mock::start(Mode::Normal, vec![]);
@@ -115,6 +143,71 @@ fn cli_preflight_is_read_only() {
     assert_eq!(mock.calls_to("student/2026000000.do").len(), 1, "{out}");
     assert!(!mock.calls_to("courseResult.do").is_empty(), "{out}");
 
+    let _ = std::fs::remove_dir_all(&dir);
+    mock.close();
+}
+
+/// 每个候选**按自己的类别**提交：一个配置里可以同时有方案内和方案外的课。
+///
+/// 这条是硬的 —— 报文里的 `teachingClassType` 和那门课的类别对不上，学校不认。
+/// 所以候选可以带 `"type"`，没写就回落到 `course.class_type`。
+#[test]
+fn cli_submits_each_candidate_with_its_own_course_type() {
+    let mock = Mock::start(Mode::Normal, vec![]);
+    let dir = stage_config(mock.port, "types");
+
+    // 把 course 换掉：class_type 是 TEST，而候选自己写着 type=FANKC —— 提交必须带 FANKC
+    let cfg_path = dir.join("config.json");
+    let raw = json::parse(&std::fs::read_to_string(&cfg_path).unwrap()).unwrap();
+    let course = json::Json::obj(vec![
+        ("keyword", json::Json::str("测试课程")),
+        ("class_type", json::Json::str("TEST")),
+        (
+            "candidates",
+            json::Json::Arr(vec![json::Json::obj(vec![
+                ("id", json::Json::str("000000000000000000000001")),
+                ("label", json::Json::str("A班")),
+                ("group", json::Json::str("星期一-3-5")),
+                ("type", json::Json::str("FANKC")),
+            ])]),
+        ),
+    ]);
+    std::fs::write(&cfg_path, replace_key(&raw, "course", course).to_compact()).unwrap();
+
+    let url = url_for(mock.port);
+    let (code, out) = run_binary(
+        &dir,
+        &[
+            "--url",
+            &url,
+            "--cookie",
+            "JSESSIONID=S1",
+            "--no-relogin",
+            "--student",
+            "2026000000",
+            "--force",
+            "--live",
+            "--now",
+            "--window",
+            "1",
+            "--burst",
+            "0.5",
+            "--interval",
+            "0.8",
+        ],
+    );
+    let writes = mock.calls_to("volunteer.do");
+    assert!(
+        !writes.is_empty(),
+        "至少要发出首发那一发（退出码 {code}）\n{out}"
+    );
+    for c in &writes {
+        let body = c.field("addParam");
+        assert!(
+            body.contains(r#""teachingClassType":"FANKC""#),
+            "候选写了 type=FANKC，报文就得带 FANKC（不是 course.class_type 的 TEST）: {body}"
+        );
+    }
     let _ = std::fs::remove_dir_all(&dir);
     mock.close();
 }

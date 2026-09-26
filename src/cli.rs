@@ -7,7 +7,7 @@
 //! 取值不合法时打印用法并以 2 退出；`--help` / `--version` 在任何时候都能用
 //! （包括还没写配置文件的时候）。
 
-use crate::config::VERSION;
+use crate::config::{APP_DIR, ENV_VAR, VERSION};
 
 #[derive(Debug, Clone)]
 pub struct Args {
@@ -56,8 +56,18 @@ pub const DEFAULT_WRITE_TIMEOUT: f64 = 4.0;
 
 pub enum Parsed {
     Run(Box<Args>),
+    /// `course-grabber tui` —— 交互式配置编辑器（`tui.rs`）
+    Tui(Box<TuiArgs>),
     /// 直接打印然后退出 0（--help / --version）
     Print(String),
+}
+
+/// `course-grabber tui` 的参数。只有"改哪份文件"两个旋钮 ——
+/// 其余一切都在界面里改。
+#[derive(Debug, Clone, Default)]
+pub struct TuiArgs {
+    pub config: Option<String>,
+    pub credentials: Option<String>,
 }
 
 impl Default for Args {
@@ -99,9 +109,70 @@ impl Default for Args {
 
 const USAGE: &str = "\
 用法: course-grabber [选项]
+       course-grabber tui [--config 文件]
 
 教务系统抢课 · 放课窗口精准首发（默认只预检，加 --live 才提交）";
 
+const TUI_USAGE: &str = "用法: course-grabber tui [选项]";
+
+fn tui_help() -> String {
+    format!(
+        "{TUI_USAGE}
+
+交互式配置编辑器：在界面里逐项填 config.json（和凭据文件），按 s 保存。
+不跑抢课流程；联网的动作只有两个（只读自检、拉取候选教学班），每次都会先问你。
+
+第一次用：进去按 w 看「三步向导」——
+  ① 粘一条选课页网址（浏览器里 Ctrl-L 全选地址栏、Ctrl-C），学校那一节就填好了
+  ② 填学号密码
+  ③ 让程序登录把课程目录拉下来，空格勾选候选教学班
+三步做完按 s 保存，然后跑 `course-grabber`（不加 --live）做只读预检。
+
+  --config 文件         编辑这个配置文件；默认按程序自己的查找顺序
+                        （{ENV_VAR} → 程序旁边 → 当前目录 → {APP_DIR}）
+                        一份都找不到时，按模板在当前目录新建 config.json
+  --credentials 文件    指定凭据文件；默认用配置里的 credentials_path
+  -h, --help            显示这段帮助
+  --version             显示版本号
+
+进去了按 ? 看按键说明。\n"
+    )
+}
+
+fn tui_err(msg: &str) -> String {
+    format!("{TUI_USAGE}\n\ncourse-grabber: error: {msg}\n")
+}
+
+/// `course-grabber tui [...]` 的参数解析。返回值里 `Err` 是要打到 stderr 的完整消息。
+fn parse_tui(argv: &[String]) -> Result<Parsed, String> {
+    let mut args = TuiArgs::default();
+    let mut i = 0usize;
+    while i < argv.len() {
+        let raw = argv[i].clone();
+        let (flag, inline) = match raw.split_once('=') {
+            Some((f, v)) if f.starts_with("--") => (f.to_string(), Some(v.to_string())),
+            _ => (raw.clone(), None),
+        };
+        match flag.as_str() {
+            "-h" | "--help" => return Ok(Parsed::Print(tui_help())),
+            "--version" => return Ok(Parsed::Print(format!("course-grabber {VERSION}\n"))),
+            "--config" | "--credentials" => {
+                let mut j = i;
+                let v = value_of(argv, &mut j, &inline, &flag)
+                    .map_err(|_| tui_err(&format!("argument {flag}: 缺少取值")))?;
+                i = j;
+                if flag == "--config" {
+                    args.config = Some(v);
+                } else {
+                    args.credentials = Some(v);
+                }
+            }
+            other => return Err(tui_err(&format!("不认识这个参数: {other}"))),
+        }
+        i += 1;
+    }
+    Ok(Parsed::Tui(Box::new(args)))
+}
 fn help() -> String {
     format!(
         "{USAGE}
@@ -151,6 +222,9 @@ fn help() -> String {
   --force               忽略单实例锁（同一账号同时只能有一个会话，跑两个会互相踢）
   -h, --help            显示这段帮助
   --version             显示版本号
+
+另有子命令
+  tui                   交互式配置编辑器：course-grabber tui --help
 "
     )
 }
@@ -197,6 +271,10 @@ const NO_CHROME_NOTE: &str =
 pub fn parse<I: IntoIterator<Item = String>>(argv: I) -> Result<Parsed, String> {
     let mut args = Args::default();
     let items: Vec<String> = argv.into_iter().collect();
+    // 子命令：`course-grabber tui`（唯一一个；其余参数都是主命令的开关）
+    if items.first().map(|s| s.as_str()) == Some("tui") {
+        return parse_tui(&items[1..]);
+    }
     let mut i = 0usize;
 
     while i < items.len() {
@@ -298,13 +376,18 @@ pub fn parse<I: IntoIterator<Item = String>>(argv: I) -> Result<Parsed, String> 
                 args.captcha_attempts = parse_int("--captcha-attempts", &v)?;
             }
             other => {
+                if other == "--tui" {
+                    return Err(format!(
+                        "{USAGE}\n\ncourse-grabber: error: 配置界面是个子命令，不带横线：`course-grabber tui`\n"
+                    ));
+                }
                 let hint = if other.starts_with('-') {
                     "未知参数"
                 } else {
                     "不认识这个位置参数"
                 };
                 return Err(format!(
-                    "{USAGE}\n\ncourse-grabber: error: {hint}: {other}\n用 --help 看全部参数。\n"
+                    "{USAGE}\n\ncourse-grabber: error: {hint}: {other}\n用 --help 看全部参数（配置界面是 `course-grabber tui`）。\n"
                 ));
             }
         }
@@ -321,6 +404,14 @@ mod tests {
         match parse(argv.iter().map(|s| s.to_string())).unwrap() {
             Parsed::Run(a) => *a,
             Parsed::Print(_) => panic!("期望是运行参数"),
+            Parsed::Tui(_) => panic!("期望是运行参数，不是配置界面"),
+        }
+    }
+
+    fn parse_tui_ok(argv: &[&str]) -> TuiArgs {
+        match parse(argv.iter().map(|s| s.to_string())).unwrap() {
+            Parsed::Tui(a) => *a,
+            _ => panic!("期望是 tui 子命令"),
         }
     }
 
@@ -362,7 +453,10 @@ mod tests {
         ));
         match parse(["--version".to_string()]).unwrap() {
             Parsed::Print(t) => assert_eq!(t.trim(), format!("course-grabber {VERSION}")),
-            Parsed::Run(_) => panic!(),
+            other => panic!(
+                "--version 应该直接打印: {}",
+                matches!(other, Parsed::Run(_))
+            ),
         }
     }
 
@@ -394,5 +488,42 @@ mod tests {
         let a = parse_ok(&["--live", "--now", "--single", "--force", "--at", "20:00:01"]);
         assert!(a.live && a.now && a.single && a.force);
         assert_eq!(a.at, "20:00:01");
+    }
+
+    #[test]
+    fn tui_subcommand_takes_its_own_args() {
+        let t = parse_tui_ok(&["tui"]);
+        assert!(t.config.is_none() && t.credentials.is_none());
+
+        let t = parse_tui_ok(&["tui", "--config", "/tmp/c.json"]);
+        assert_eq!(t.config.as_deref(), Some("/tmp/c.json"));
+        let t = parse_tui_ok(&[
+            "tui",
+            "--config=/tmp/c.json",
+            "--credentials",
+            "/tmp/k.json",
+        ]);
+        assert_eq!(t.config.as_deref(), Some("/tmp/c.json"));
+        assert_eq!(t.credentials.as_deref(), Some("/tmp/k.json"));
+
+        match parse(["tui".to_string(), "--help".to_string()]).unwrap() {
+            Parsed::Print(t) => assert!(t.contains("course-grabber tui")),
+            _ => panic!("tui --help 应该直接打印帮助"),
+        }
+        // 拒绝不认识的东西，并且报的是子命令的用法
+        match parse(["tui".to_string(), "--live".to_string()]) {
+            Err(m) => assert!(m.contains("用法: course-grabber tui"), "{m}"),
+            Ok(_) => panic!("--live 不属于 tui"),
+        }
+        assert!(parse(["tui".to_string(), "--config".to_string()]).is_err());
+        assert!(parse(["tui".to_string(), "junk".to_string()]).is_err());
+    }
+
+    #[test]
+    fn tui_with_dashes_points_at_the_subcommand() {
+        match parse(["--tui".to_string()]) {
+            Err(m) => assert!(m.contains("course-grabber tui"), "{m}"),
+            Ok(_) => panic!("--tui 不是合法参数"),
+        }
     }
 }

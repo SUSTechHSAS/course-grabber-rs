@@ -195,19 +195,8 @@ pub fn load_credentials(
         )));
     }
 
-    let sid = pick(
-        &raw,
-        &[
-            "student_id",
-            "studentId",
-            "student",
-            "code",
-            "username",
-            "loginName",
-            "学号",
-        ],
-    );
-    let pwd = pick(&raw, &["password", "passwd", "pwd", "密码"]);
+    let sid = pick(&raw, crate::config::STUDENT_KEY_ALIASES);
+    let pwd = pick(&raw, crate::config::PASSWORD_KEY_ALIASES);
     if sid.is_empty() || pwd.is_empty() {
         return Err(AuthError::LoginUnavailable(format!(
             "凭据文件里缺少 student_id / password: {}",
@@ -251,6 +240,30 @@ fn warn_if_world_readable(path: &Path) {
 // ==========================================================================
 // 二、验证码：抓图（学校接口）+ 识别（内编模型）
 // ==========================================================================
+
+/// 一条 Set-Cookie 的 Cookie 名：`JSESSIONID=abc; Path=/` → `JSESSIONID`。
+pub fn cookie_name(set_cookie: &str) -> Option<String> {
+    let first = set_cookie.split(';').next()?.trim();
+    let (name, _) = first.split_once('=')?;
+    let name = name.trim();
+    if name.is_empty() || name.contains(char::is_whitespace) {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+/// 一批 Set-Cookie 里出现过的名字（保持出现顺序、去重）。
+pub fn cookie_names(set_cookie: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in set_cookie {
+        if let Some(n) = cookie_name(raw) {
+            if !out.contains(&n) {
+                out.push(n);
+            }
+        }
+    }
+    out
+}
 
 /// 从 Set-Cookie 里取出指定名字，保持 names 的顺序，不破坏 Expires 里的逗号。
 ///
@@ -440,6 +453,11 @@ pub struct LoginSession {
     pub cookie: String,
     pub name: String,
     pub referer: String,
+    /// 登录响应里**服务器实际下发**的所有 Cookie 名。
+    ///
+    /// 只用来核对配置：`cookies.session` 是手写的名单，漏一个（脱敏后的示例配置就少了
+    /// `_WEU`）会导致登录态带不全而没人发现。配置界面靠这个把漏的补上。
+    pub observed_cookies: Vec<String>,
 }
 
 impl LoginSession {
@@ -621,6 +639,7 @@ impl<'a> Login<'a> {
             return Ok(LoginSession {
                 token,
                 cookie,
+                observed_cookies: cookie_names(&resp.set_cookies()),
                 name: payload
                     .object("data")
                     .map(|d| d.text("name"))
@@ -817,6 +836,34 @@ pub fn no_credentials_note(default_path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cookie_names_for_config_checking() {
+        // 只取名字，不碰值；Expires 里的逗号也不能把它切歪
+        assert_eq!(
+            cookie_name("JSESSIONID=abc; Path=/").as_deref(),
+            Some("JSESSIONID")
+        );
+        assert_eq!(cookie_name("_WEU=x").as_deref(), Some("_WEU"));
+        assert_eq!(
+            cookie_name("route=1; Path=/someapp").as_deref(),
+            Some("route")
+        );
+        assert_eq!(
+            cookie_name("a=b; Expires=Wed, 21 Oct 2026 07:28:00 GMT").as_deref(),
+            Some("a")
+        );
+        assert!(cookie_name("garbage").is_none());
+        assert!(cookie_name("=x").is_none());
+
+        // 一批里出现过哪些名字：保持顺序、去重
+        let got = cookie_names(&[
+            "JSESSIONID=S1; Path=/".to_string(),
+            "EXTRA=W1; Path=/".to_string(),
+            "JSESSIONID=S2; Path=/".to_string(),
+        ]);
+        assert_eq!(got, vec!["JSESSIONID", "EXTRA"]);
+    }
 
     #[test]
     fn set_cookie_not_confused_by_expires_comma() {

@@ -23,8 +23,23 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// 第一次运行时写给用户的配置模板（编进二进制，所以"只有那一个文件"真的够用）。
 pub const CONFIG_EXAMPLE: &str = include_str!("../config.example.json");
 
+/// 凭据文件里"学号"和"密码"可能叫的名字。
+///
+/// 放在 config 里而不是 auth 里，是因为 TUI（`tui.rs`）也要按同一张表去认这两个键 ——
+/// 两处各写一份迟早会漂移，那就变成"界面能改的键，程序其实不读"。
+pub const STUDENT_KEY_ALIASES: &[&str] = &[
+    "student_id",
+    "studentId",
+    "student",
+    "code",
+    "username",
+    "loginName",
+    "学号",
+];
+pub const PASSWORD_KEY_ALIASES: &[&str] = &["password", "passwd", "pwd", "密码"];
+
 /// 与学校无关的工程默认值。config.json 里没写的键就用这里的。
-fn engine_defaults() -> Json {
+pub fn engine_defaults() -> Json {
     json::parse_or_empty(
         r#"{
           "timezone_offset_hours": 8,
@@ -109,26 +124,49 @@ impl Config {
     }
 }
 
+/// 配置文件的查找顺序（先找到的先用），`~` 已经展开。
+///
+/// `load` 与 TUI（`tui.rs`）共用这一份，于是"界面里编辑的是哪一份"和
+/// "程序跑起来读的是哪一份"必然是同一个答案。
+pub fn config_candidates(path: Option<&Path>) -> Vec<PathBuf> {
+    if let Some(p) = path {
+        return vec![expand_tilde(&p.to_string_lossy())];
+    }
+    let mut v: Vec<PathBuf> = Vec::new();
+    if let Ok(env) = std::env::var(ENV_VAR) {
+        if !env.is_empty() {
+            v.push(expand_tilde(&env));
+        }
+    }
+    v.push(here().join("config.json"));
+    if let Ok(cwd) = std::env::current_dir() {
+        v.push(cwd.join("config.json"));
+    }
+    v.push(expand_tilde(&format!("{APP_DIR}/config.json")));
+    v
+}
+
+/// 把配置写回文件：2 空格缩进 + 末尾换行（和 `config.example.json` 一个风格）。
+/// TUI 里按 `s` 走的就是这里。
+pub fn write_config(path: &Path, raw: &Json) -> Result<(), ConfigError> {
+    // 目标目录不存在就建：`COURSE_GRABBER_CONFIG=~/.config/course-grabber/config.json`
+    // 是很自然的用法，而那个目录在第一次用时通常还不存在。
+    if let Some(dir) = path.parent() {
+        if !dir.as_os_str().is_empty() && !dir.is_dir() {
+            std::fs::create_dir_all(dir)
+                .map_err(|e| ConfigError(format!("建目录失败 {}: {e}", dir.display())))?;
+        }
+    }
+    let text = format!("{}\n", raw.to_pretty());
+    std::fs::write(path, text).map_err(|e| ConfigError(format!("写不了 {}: {e}", path.display())))
+}
+
 /// 读配置。`path` 给了就只读它。
 pub fn load(path: Option<&Path>) -> Result<Config, ConfigError> {
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Some(p) = path {
-        candidates.push(p.to_path_buf());
-    } else {
-        if let Ok(env) = std::env::var(ENV_VAR) {
-            if !env.is_empty() {
-                candidates.push(PathBuf::from(env));
-            }
-        }
-        candidates.push(here().join("config.json"));
-        if let Ok(cwd) = std::env::current_dir() {
-            candidates.push(cwd.join("config.json"));
-        }
-        candidates.push(expand_tilde(&format!("{APP_DIR}/config.json")));
-    }
+    let candidates = config_candidates(path);
 
     for cand in &candidates {
-        let p = expand_tilde(&cand.to_string_lossy());
+        let p = cand.clone();
         if !p.is_file() {
             continue;
         }
@@ -164,12 +202,15 @@ pub fn load(path: Option<&Path>) -> Result<Config, ConfigError> {
     };
     if !target.exists() && std::fs::write(&target, example_text).is_ok() {
         return Err(ConfigError(format!(
-            "第一次运行：已按模板生成配置文件\n    {}\n请填上你学校的域名、接口路径与候选教学班，然后重新运行。",
+            "第一次运行：已按模板生成配置文件\n    {}\n\
+             填它最省事的办法是跑 `course-grabber tui`，照「配置向导」一步一步走：\n\
+             粘一条选课页网址 → 填学号密码 → 勾几个教学班，按 s 保存；\n\
+             也可以直接编辑这个文件（要填学校的域名、接口路径与候选教学班），然后重新运行。",
             target.display()
         )));
     }
     Err(ConfigError(format!(
-        "找不到配置文件。先照着模板填一份：\n    cp {} {}\n    # 然后编辑它，填上你学校的域名与接口路径\n也可以放到 {APP_DIR}/config.json，或用环境变量 {ENV_VAR} 指定路径。",
+        "找不到配置文件。先照着模板填一份：\n    cp {} {}\n    # 然后在它旁边跑 `course-grabber tui` 逐项填，或者直接编辑它\n也可以放到 {APP_DIR}/config.json，或用环境变量 {ENV_VAR} 指定路径。",
         example.display(),
         target.display()
     )))
@@ -193,6 +234,11 @@ pub struct Candidate {
     pub id: String,
     pub label: String,
     pub group: String,
+    /// 这门课属于哪一类（`teachingClassType`）。`None` = 用 `course.class_type`。
+    ///
+    /// 配置里可以给每个候选写 `"type": "FANKC"` —— 抢课时的提交报文必须带对类别，
+    /// 而一个配置里可能同时有方案内和方案外的课（配置界面就是这么写回来的）。
+    pub tc_type: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -292,7 +338,7 @@ impl Config {
         let host = kind("host").map(|v| v.as_text()).unwrap_or_default();
         if host.trim().is_empty() {
             return Err(ConfigError(format!(
-                "配置不完整（缺 school.host）: {}\n  照 config.example.json 填一份 config.json 再跑。",
+                "配置不完整（缺 school.host）: {}\n  照 config.example.json 填一份 config.json 再跑，或者跑 `course-grabber tui` 逐项填。",
                 self.source
             )));
         }
@@ -306,7 +352,7 @@ impl Config {
         let paths = self.raw.object("paths").cloned().unwrap_or(Json::Null);
         if !matches!(paths, Json::Obj(ref p) if !p.is_empty()) {
             return Err(ConfigError(format!(
-                "配置不完整（缺 paths）: {}\n  照 config.example.json 填一份 config.json 再跑。",
+                "配置不完整（缺 paths）: {}\n  照 config.example.json 填一份 config.json 再跑，或者跑 `course-grabber tui` 逐项填。",
                 self.source
             )));
         }
@@ -330,7 +376,7 @@ impl Config {
         .collect();
         if !missing.is_empty() {
             return Err(ConfigError(format!(
-                "配置里缺少这些接口路径 paths.*: {}\n  照 config.example.json 填一份 config.json 再跑。",
+                "配置里缺少这些接口路径 paths.*: {}\n  照 config.example.json 填一份 config.json 再跑，或者跑 `course-grabber tui` 逐项填。",
                 missing.join(", ")
             )));
         }
@@ -375,17 +421,28 @@ impl Config {
 
         let mut candidates = Vec::new();
         for item in course.array("candidates") {
-            let (id, label, group) = match item {
-                Json::Obj(_) => (item.text("id"), item.text("label"), item.text("group")),
+            let (id, label, group, tc_type) = match item {
+                Json::Obj(_) => (
+                    item.text("id"),
+                    item.text("label"),
+                    item.text("group"),
+                    Some(item.text("type")).filter(|s| !s.trim().is_empty()),
+                ),
                 Json::Arr(parts) => (
                     parts.first().map(|v| v.as_text()).unwrap_or_default(),
                     parts.get(1).map(|v| v.as_text()).unwrap_or_default(),
                     parts.get(2).map(|v| v.as_text()).unwrap_or_default(),
+                    None,
                 ),
                 _ => continue,
             };
             if !id.is_empty() {
-                candidates.push(Candidate { id, label, group });
+                candidates.push(Candidate {
+                    id,
+                    label,
+                    group,
+                    tc_type,
+                });
             }
         }
 
@@ -611,5 +668,21 @@ mod tests {
         std::env::set_var("HOME", "/tmp/fakehome");
         assert_eq!(expand_tilde("~/x/y"), PathBuf::from("/tmp/fakehome/x/y"));
         assert_eq!(expand_tilde("/abs/path"), PathBuf::from("/abs/path"));
+    }
+
+    /// TUI 保存走的就是这个函数：缩进能读回来、目录不存在就建。
+    #[test]
+    fn write_config_round_trips_and_creates_dirs() {
+        let dir = std::env::temp_dir().join(format!("cg-cfg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let p = dir.join("nested/deeper/config.json");
+        let raw = json::parse(r#"{"school":{"host":"h","port":80},"keep":1}"#).unwrap();
+        write_config(&p, &raw).unwrap();
+
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.ends_with("\n"), "{text:?}");
+        assert!(text.contains("\n  \"school\": {"), "{text}");
+        assert_eq!(json::parse(&text).unwrap(), raw);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

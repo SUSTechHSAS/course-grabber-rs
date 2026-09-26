@@ -447,7 +447,11 @@ fn fire_round_waits_for_response_not_a_fixed_sleep() {
     );
     school.set_code(STUDENT);
     school.set_pacer(Arc::new(WritePacer::new(3, 1.0, 0.15, 0.0)));
-    let targets: Vec<String> = vec!["TC1".to_string(), "TC2".to_string(), "TC3".to_string()];
+    let targets: Vec<grab::Target> = vec![
+        grab::Target::new("TC1", "A班"),
+        grab::Target::new("TC2", "B班"),
+        grab::Target::new("TC3", "C班"),
+    ];
 
     let t0 = std::time::Instant::now();
     let res = grab::fire_round(&school, STUDENT, "B1", "01", &targets, Some(2.0), 0.35);
@@ -509,8 +513,8 @@ fn init_outage_keeps_firing() {
     let groups = vec![Group {
         name: "星期一-3-5".to_string(),
         members: vec![
-            ("000000000000000000000001".to_string(), "A班".to_string()),
-            ("000000000000000000000002".to_string(), "B班".to_string()),
+            grab::Target::new("000000000000000000000001", "A班"),
+            grab::Target::new("000000000000000000000002", "B班"),
         ],
     }];
     let fire_at = timeutil::unix_now();
@@ -534,4 +538,447 @@ fn init_outage_keeps_firing() {
         "停机期间仍在写（不是安静地轮询）：只发了 {writes} 发 @ {stamps:?}"
     );
     mock.close();
+}
+
+// ==========================================================================
+// [N] 开荒：让普通用户"粘一条网址 + 学号密码"就能把配置填出来
+// ==========================================================================
+
+/// `log::with_sink` 是 TUI 里"把库的进度日志搬进自己的面板"那根线：
+/// 设置之后 `info()` 不再往 stdout 打，而是交给回调。
+#[test]
+fn log_sink_captures_progress_lines() {
+    use std::sync::{Arc, Mutex};
+    let got = Arc::new(Mutex::new(Vec::<String>::new()));
+    let sink = Arc::clone(&got);
+    course_grabber::log::with_sink(
+        move |m| sink.lock().unwrap().push(m.to_string()),
+        || {
+            course_grabber::log::log("第一行");
+            course_grabber::log::info("第二行");
+        },
+    );
+    let lines = got.lock().unwrap().clone();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert_eq!(lines[0], "第一行");
+    assert!(lines[1].contains("第二行"), "{:?}", lines[1]);
+    assert!(
+        lines[1].starts_with('['),
+        "info() 要带时间戳：{:?}",
+        lines[1]
+    );
+
+    // 出了 with_sink 之后回到 stdout —— 这里只确认不 panic、也不写进已经关掉的 sink
+    course_grabber::log::with_sink(|_| {}, || course_grabber::log::log("不进 stdout 的"));
+    course_grabber::log::log("");
+}
+
+/// 从网址推出"学校"那一节，再接上"按参考实现补齐"——
+/// 合起来就是用户按一次 Enter 之后发生的事。
+#[test]
+fn onboarding_fills_a_runnable_school_section() {
+    use course_grabber::json::Json;
+    let mut raw = json::parse(r#"{"school":{"host":"course.example.edu.cn"}}"#).unwrap();
+    // 用户最可能粘的那条：完整选课页网址（带 token）
+    let input = "http://jw.example.edu.cn/course-system/*default/grablessons.do?token=abcd1234";
+    let parts = course_grabber::onboard::parse_input(input).unwrap();
+    let d = course_grabber::onboard::derive_from_path(&parts, &parts.path);
+    let notes = course_grabber::onboard::apply(&mut raw, &d, Some("/course-system/"));
+
+    // 推导出来的四项
+    assert_eq!(
+        raw.object("school").unwrap().text("host"),
+        "jw.example.edu.cn"
+    );
+    assert_eq!(
+        raw.object("school").unwrap().text("base_path"),
+        "/course-system"
+    );
+    assert_eq!(
+        raw.object("school").unwrap().text("page_path"),
+        "/course-system/*default/index.do"
+    );
+    // 补齐的键让这份配置真的能跑起来
+    assert_eq!(raw.object("password").unwrap().array("des_keys").len(), 3);
+    assert_eq!(raw.object("cookies").unwrap().array("captcha").len(), 2);
+    assert!(raw
+        .object("paths")
+        .unwrap()
+        .text("volunteer")
+        .contains("{base}"));
+
+    // 补完之后程序自己就认了（除了 host 指向一个不存在的地方，配置层面是完整的）
+    let ep = Config::from_raw(raw.clone(), "tui")
+        .endpoints()
+        .expect("补齐之后配置应当能解析");
+    assert_eq!(ep.base_path, "/course-system");
+    assert_eq!(ep.host, "jw.example.edu.cn");
+    assert_eq!(ep.path("volunteer"), "/course-system/elective/volunteer.do");
+
+    // 提示里必须说清楚"哪一条是猜的"——不许让用户以为全是确定的
+    assert!(
+        notes
+            .iter()
+            .any(|(l, t)| *l == course_grabber::onboard::Level::Warn && t.contains("参考实现")),
+        "{notes:?}"
+    );
+    assert!(
+        notes.iter().any(|(_, t)| t.contains("Referer")),
+        "得说明 Referer 没动：{notes:?}"
+    );
+    let _ = Json::Null;
+}
+
+/// 登录 → 读批次 → 查课程目录 → 挑候选，整条链路对着假学校跑通。
+#[test]
+fn onboarding_fetches_candidates_from_mock_school() {
+    let mock = Mock::start(Mode::Catalog, vec![]);
+    let ep = endpoints(mock.port);
+    // 每一类都拉了一遍（假学校对每一类都回同样那门课，所以五类五份）
+    let got = course_grabber::onboard::fetch_catalog(&ep, &creds(), &StubSolver, 6, 0.01)
+        .expect("登录 + 拉目录应当成功");
+    assert_eq!(got.types.len(), 5, "{:?}", got.types);
+    assert!(got.types.iter().all(|(_, _, n)| *n == 4), "{:?}", got.types);
+    // 每一行都带着自己属于哪一类 —— 提交选课时要带对
+    for r in &got.rows {
+        assert!(!r.tc_type.is_empty());
+    }
+    assert!(got.rows.iter().any(|r| r.tc_type == "FANKC"));
+    assert!(got.rows.iter().any(|r| r.tc_type == "MOOC"));
+    // 这一页没满（4 < 50），所以每一类只问了一页
+    assert_eq!(mock.calls_to("programCourse.do").len(), 5);
+
+    assert_eq!(got.student_name, "测试同学");
+    assert_eq!(got.batch_code, "B1");
+    assert_eq!(got.batch_name, "正选");
+    assert_eq!(got.campus, "01");
+    // 不筛关键词：整类课都在里面（"别的课"那门也在 —— 这才叫"拉全量让用户自己挑"）
+    assert_eq!(got.rows.len(), 20, "五类 × 4 个教学班");
+    assert!(got
+        .rows
+        .iter()
+        .any(|r| r.tc_id == "000000000000000000000999"));
+
+    // 冲突组从上课地点里推出来；推不出来（"待定"）就照实留空
+    assert_eq!(got.rows[0].group, "星期一-3-5");
+    assert_eq!(got.rows[1].group, "星期三-3-5");
+    assert_eq!(got.rows[2].group, "");
+    assert_eq!(got.rows[0].label(), "01班 张老师 星期一-3-5");
+    assert_eq!(got.rows[1].is_full, "1");
+    assert_eq!(got.rows[2].is_conflict, "1");
+    // 全程只读：一条写请求都不许发
+    assert_eq!(mock.write_count(), 0, "开荒阶段绝不能有写请求");
+
+    // 勾两个写回配置：整段替换，并记下关键词
+    let mut raw = json::parse(TEST_CONFIG).unwrap();
+    let n = course_grabber::onboard::write_candidates(
+        &mut raw,
+        &[&got.rows[0], &got.rows[2]],
+        "测试课程",
+    );
+    assert_eq!(n, 2);
+    let cands = raw.object("course").unwrap().array("candidates").to_vec();
+    assert_eq!(cands.len(), 2);
+    assert_eq!(cands[0].text("id"), "000000000000000000000101");
+    assert_eq!(cands[0].text("label"), "01班 张老师 星期一-3-5");
+    assert_eq!(cands[0].text("group"), "星期一-3-5");
+    assert_eq!(cands[1].text("group"), "", "推不出冲突组就留空，别编一个");
+    // 类型写进每个候选：一次可能同时挑方案内 + 方案外，提交时每一发都要带对
+    assert_eq!(cands[0].text("type"), "FANKC");
+    mock.close();
+}
+
+/// 目录整个是空的（不是选课时间 / 学校没开）时，要说人话。
+#[test]
+fn onboarding_says_something_useful_when_the_catalog_is_empty() {
+    // 有批次、但目录是空的（不是选课时间时就是这样）
+    let mock = Mock::start(Mode::EmptyCatalog, vec![]);
+    let ep = endpoints(mock.port);
+    let err = course_grabber::onboard::fetch_catalog(&ep, &creds(), &StubSolver, 6, 0.01)
+        .expect_err("目录为空就该报错");
+    assert!(err.contains("一门都没有"), "{err}");
+    assert!(err.contains("不是选课时间"), "{err}");
+    mock.close();
+}
+
+/// 只读自检：假学校对不存在的路径也回 200，所以它必须**照实说"判断不了"**，
+/// 不能因为看到 200 就宣布"路径存在"。
+#[test]
+fn probe_reports_honestly_against_the_mock() {
+    use course_grabber::onboard::Level;
+    let mock = Mock::start(Mode::Normal, vec![]);
+    let ep = endpoints(mock.port);
+    let lines = course_grabber::onboard::probe(&ep);
+
+    assert!(lines.len() > 3, "{lines:?}");
+    // 先报了"对照路径"
+    assert!(lines.iter().any(|(_, t)| t.contains("对照")), "{lines:?}");
+    // 顺便读到了服务器时钟（Date 头），这是对时那套的输入
+    assert!(
+        lines.iter().any(|(_, t)| t.contains("服务器时钟")),
+        "{lines:?}"
+    );
+    // 关键：假服务端什么都回 200，所以判断只能是"判断不了"，绝不是"存在"
+    assert!(
+        lines.iter().any(|(_, t)| t.contains("判断不了")),
+        "对不存在的路径也回 200 的服务器，必须照实说判断不了：{lines:?}"
+    );
+    // 没有一条被判成 ✗：它明明有响应
+    assert!(lines.iter().all(|(l, _)| *l != Level::Err), "{lines:?}");
+    assert_eq!(mock.write_count(), 0, "自检只发 GET");
+    mock.close();
+}
+
+/// "只粘一个域名"也要能配好 —— 服务器把页面路径告诉我们（根路径 302 到应用页）。
+#[test]
+fn onboarding_discovers_everything_from_a_bare_host() {
+    let mock = Mock::start(Mode::Catalog, vec![]);
+    let out = course_grabber::onboard::discover(&format!("127.0.0.1:{}", mock.port), &|_| {})
+        .expect("只给域名也应当能问到路径");
+
+    assert_eq!(out.derived.host, "127.0.0.1");
+    assert_eq!(out.derived.port, mock.port as i64);
+    assert_eq!(out.derived.base_path.as_deref(), Some("/api"));
+    assert_eq!(
+        out.derived.page_path.as_deref(),
+        Some("/api/*default/index.do")
+    );
+    // 每条结论都要能看见"凭什么"：重定向、接口前缀验证、Cookie
+    let said = |needle: &str| out.notes.iter().any(|(_, t)| t.contains(needle));
+    assert!(said("指到了"), "{:?}", out.notes);
+    assert!(said("接口前缀验证过"), "{:?}", out.notes);
+    // 假服务端每个响应都带 Date，所以第一候选 "/" 就够用 —— 不必写 time_path
+    assert_eq!(out.time_path, None);
+    assert!(said("带 Date 头"), "{:?}", out.notes);
+    // 顺路记下服务器下发的 Cookie 名
+    assert!(
+        out.cookie_names.iter().any(|n| n == "route"),
+        "{:?}",
+        out.cookie_names
+    );
+
+    // 全程只读：一条写请求都没有
+    assert_eq!(mock.write_count(), 0);
+    mock.close();
+}
+
+/// 认不出的系统（既没有 `*default` 也没有 `/api`）：只填域名端口，并且**明说**。
+#[test]
+fn onboarding_says_so_when_it_cannot_figure_out_the_paths() {
+    let mock = Mock::start(Mode::Normal, vec![]);
+    // 这条路径既没有 `*default`，也不是根路径 —— 服务器回什么都不会被认成应用页
+    let out = course_grabber::onboard::discover(
+        &format!(
+            "http://127.0.0.1:{}/jwglxt/xtgl/login_slogin.html",
+            mock.port
+        ),
+        &|_| {},
+    )
+    .expect("连通了就该有结果（只是推不出路径）");
+    assert_eq!(out.derived.host, "127.0.0.1");
+    assert!(out.derived.base_path.is_none());
+    assert!(
+        !out.derived.warns.is_empty()
+            || out
+                .notes
+                .iter()
+                .any(|(l, _)| *l == course_grabber::onboard::Level::Warn),
+        "推不出路径必须说清楚，不能让用户以为配好了：{:?} {:?}",
+        out.derived.warns,
+        out.notes
+    );
+    mock.close();
+}
+
+/// 服务器下发的会话 Cookie 名比配置里列的全时，要**自己补上并重登一次**。
+///
+/// 真实例子：脱敏后的示例配置 `cookies.session` 只有 `JSESSIONID`，而学校登录时
+/// 还会下发 `_WEU` —— 少带一个 Cookie，后面每个接口都可能被判未登录。
+/// 假学校在 login.do 上下发 `JSESSIONID` + `EXTRA`，正好当这个场景的替身。
+#[test]
+fn onboarding_widens_session_cookies_observed_at_login() {
+    let mock = Mock::start(Mode::Catalog, vec![]);
+    let ep = endpoints(mock.port);
+    assert_eq!(
+        ep.session_cookies,
+        vec!["JSESSIONID"],
+        "测试配置里只列了一个"
+    );
+
+    let got = course_grabber::onboard::fetch_catalog(&ep, &creds(), &StubSolver, 6, 0.01)
+        .expect("补上 Cookie 之后应当照样跑通");
+
+    assert!(
+        got.session_cookies.iter().any(|n| n == "EXTRA"),
+        "登录时下发的 EXTRA 应当被补进名单：{:?}",
+        got.session_cookies
+    );
+    assert_eq!(got.session_cookies[0], "JSESSIONID", "配置里写的排前面");
+    // 补上之后**用新名单重新登录过**：所以 login.do 被打了两次
+    assert_eq!(
+        mock.calls_to("login.do").len(),
+        2,
+        "名单变了要重登一次，否则这次会话仍然缺 Cookie"
+    );
+    // 依然全程只读
+    assert_eq!(mock.write_count(), 0);
+    mock.close();
+}
+
+/// 仓库里不许出现真实学校的信息 —— 这是这个项目的立足点
+/// （"一套配置驱动的工具"，不是"某校的工具"）。
+///
+/// 只查最容易漏、也最伤的一类：源码 / 配置 / 文档里出现的 `*.edu.cn` 主机名
+/// 必须落在 `example` 域里（占位符长这样：`jw.example.edu.cn`）。
+///
+/// 写这条测试是因为真的漏过 —— 有个功能是照着真实系统做的，写测试时顺手就把
+/// 真实域名和部署路径抄了进去，`grep` 才发现。它拦不住"把真实路径抄进去"
+/// （路径没有通用形状可判），那还得靠人看着。
+#[test]
+fn source_has_no_real_school_names() {
+    fn collect(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if p.is_dir() {
+                // 构建产物和工作区不查
+                if matches!(name, "target" | "dist" | ".git" | "__pycache__") {
+                    continue;
+                }
+                collect(&p, out);
+            } else if matches!(
+                p.extension().and_then(|x| x.to_str()),
+                Some("rs" | "json" | "md" | "sh" | "yml" | "yaml" | "toml")
+            ) {
+                out.push(p);
+            }
+        }
+    }
+
+    /// 一段文本里所有"教育网主机名"，以及其中不像占位符的那些。
+    fn suspicious(text: &str) -> Vec<String> {
+        let bytes = text.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while let Some(at) = text[i..].find(".edu.cn") {
+            let at = i + at + ".edu.cn".len();
+            // 往左走：取完整的主机名
+            let mut start = at - ".edu.cn".len();
+            while start > 0
+                && (bytes[start - 1].is_ascii_alphanumeric()
+                    || matches!(bytes[start - 1], b'.' | b'-'))
+            {
+                start -= 1;
+            }
+            i = at;
+            let host = &text[start..at];
+            // 得有"主机名"的形状：至少一个字母/数字打头的标签，否则就是裸写的 ".edu.cn"
+            let has_label = host.len() > ".edu.cn".len()
+                && host[..host.len() - ".edu.cn".len()]
+                    .rsplit('.')
+                    .next()
+                    .map(|l| !l.is_empty() && l.chars().any(|c| c.is_ascii_alphabetic()))
+                    .unwrap_or(false);
+            if has_label && !host.ends_with("example.edu.cn") {
+                out.push(host.to_string());
+            }
+        }
+        out
+    }
+
+    // 先证明这个检查真的会报警（用一个不存在学校的域名当样本）
+    assert_eq!(
+        suspicious("见 http://jw.some-university.edu.cn/ 的说明"),
+        vec!["jw.some-university.edu.cn".to_string()]
+    );
+    assert!(suspicious("占位符 jw.example.edu.cn 不算").is_empty());
+
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    collect(root, &mut files);
+    assert!(files.len() > 5, "没扫到文件，测试本身有问题");
+
+    let mut bad: Vec<String> = Vec::new();
+    for f in &files {
+        // 跳过守卫自己：它的样本字符串、以及下面那句格式串，本来就会命中这个模式
+        if f.ends_with("tests/offline.rs") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(f) else {
+            continue;
+        };
+        for host in suspicious(&text) {
+            bad.push(format!(
+                "{}: {host}",
+                f.strip_prefix(root).unwrap_or(f).display()
+            ));
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "这些文件里出现了像真实学校的主机名（要脱敏成 *.example.edu.cn）：\n{}",
+        bad.join("\n")
+    );
+}
+
+/// 目录查询会把**每一类**都拉一遍，而且每一行都带着自己属于哪一类。
+///
+/// 为什么要这样：同一门课在方案内 / 方案外 / 校公选下都可能开，名字还一模一样 ——
+/// 只让用户打关键词搜，他分不清是哪一类；只查一类，又会漏掉其他的。
+#[test]
+fn onboarding_pulls_every_category_and_pages_through() {
+    let mock = Mock::start(Mode::ByCategory, vec![]);
+    let ep = endpoints(mock.port);
+    let got = course_grabber::onboard::fetch_catalog(&ep, &creds(), &StubSolver, 6, 0.01)
+        .expect("每一类都该拉到东西");
+
+    // 五类都有结果，每类 55 个教学班（假服务端发了 50 + 5 两页）
+    assert_eq!(got.types.len(), 5, "{:?}", got.types);
+    assert!(
+        got.types.iter().all(|(_, _, n)| *n == 55),
+        "{:?}",
+        got.types
+    );
+    assert_eq!(got.rows.len(), 275, "五类 × 每类 55");
+
+    // 每一行都标着自己的类别，ID 也能对上（提交选课时带的就是这个类别）
+    for r in &got.rows {
+        assert!(!r.tc_type.is_empty());
+        assert!(
+            r.tc_id.contains(&r.tc_type),
+            "{} 的类别标签应当是 {}",
+            r.tc_id,
+            r.tc_type
+        );
+    }
+    // 分页确实翻了：五类 × 两页 = 10 次目录请求
+    assert_eq!(
+        mock.calls_to("programCourse.do").len(),
+        10,
+        "每一类都该按 totalCount 翻到第二页"
+    );
+    // 第二页也真的被算进去了（不是只看第一页）
+    assert!(got.rows.iter().any(|r| r.tc_id.ends_with("-54")));
+    // 全程只读
+    assert_eq!(mock.write_count(), 0);
+    mock.close();
+}
+
+/// 类型代码翻成人话（界面上给用户看的）。
+#[test]
+fn course_type_labels() {
+    use course_grabber::onboard::{type_label, COURSE_TYPES};
+    assert_eq!(type_label("FANKC"), "方案内课程（FANKC）");
+    assert_eq!(type_label("fawkc"), "方案外课程（FAWKC）");
+    assert_eq!(type_label(""), "（没填课程类型）");
+    assert_eq!(type_label("XXXX"), "XXXX");
+    // 类型表里必须有这两类 —— 方案内/方案外是"能不能抢必修课"的分水岭
+    let codes: Vec<&str> = COURSE_TYPES.iter().map(|(c, _)| *c).collect();
+    assert!(
+        codes.contains(&"FANKC") && codes.contains(&"FAWKC"),
+        "{codes:?}"
+    );
 }

@@ -762,13 +762,37 @@ impl School {
     }
 
     /// 从学校课程目录解析候选教学班（只读，用于建白名单）。
+    ///
+    /// `class_type` 就是请求里的 `teachingClassType`：**它决定服务器回哪一类课**
+    /// （方案内 / 方案外 / 校公选 / 体育 / 慕课）。配置里那个 `course.class_type`
+    /// 是默认值；配置界面会在"你配的那类里查不到"时换别的类型再问一次，
+    /// 好告诉用户"这门课其实属于方案内"。
     pub fn catalog_candidates(
         &self,
         code: &str,
         batch: &str,
         campus: &str,
         keyword: &str,
+        class_type: &str,
     ) -> Result<Vec<CatalogRow>, SchoolError> {
+        Ok(self
+            .catalog_page(code, batch, campus, keyword, class_type, 0)?
+            .rows)
+    }
+
+    /// 目录的一页。
+    ///
+    /// `page` 从 0 开始（前端就是这么传的）。分页要看的两个数是**课程条数**：
+    /// `totalCount` 是课程数，而 `dataList` 每一项带多个教学班 —— 拿教学班数去比会永远翻不完。
+    pub fn catalog_page(
+        &self,
+        code: &str,
+        batch: &str,
+        campus: &str,
+        keyword: &str,
+        class_type: &str,
+        page: i64,
+    ) -> Result<CatalogPage, SchoolError> {
         let setting = Json::obj(vec![
             (
                 "data",
@@ -777,7 +801,7 @@ impl School {
                     ("campus", Json::str(campus)),
                     ("electiveBatchCode", Json::str(batch)),
                     ("isMajor", Json::str(self.ep.is_major.clone())),
-                    ("teachingClassType", Json::str(self.ep.class_type.clone())),
+                    ("teachingClassType", Json::str(class_type.to_string())),
                     ("checkConflict", Json::str("2")),
                     ("checkCapacity", Json::str("2")),
                     (
@@ -786,8 +810,8 @@ impl School {
                     ),
                 ]),
             ),
-            ("pageSize", Json::str("50")),
-            ("pageNumber", Json::str("0")),
+            ("pageSize", Json::str(PAGE_SIZE.to_string())),
+            ("pageNumber", Json::str(page.to_string())),
             ("order", Json::str("")),
             ("orderBy", Json::str("courseNumber")),
         ]);
@@ -801,9 +825,17 @@ impl School {
             )
             .map_err(|e| SchoolError::Other(e.to_string()))?;
 
+        let total = payload
+            .get("totalCount")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(-1);
+        let courses = payload.array("dataList").len();
         let mut out = Vec::new();
         for course in payload.array("dataList") {
-            if !course.text("courseName").contains(keyword) {
+            // 关键词过滤留在客户端做（服务端那个 queryContent 里还有 MOOC:2 之类的开关，
+            // 交给配置去拼；界面要的是"整类课"，自己在结果里筛更可控）
+            let name = course.text("courseName");
+            if !keyword.is_empty() && !name.contains(keyword) {
                 continue;
             }
             for tc in course.array("tcList") {
@@ -816,10 +848,15 @@ impl School {
                     credit: non_empty(course.text("credit"), "0"),
                     is_full: tc.text("isFull"),
                     is_conflict: tc.text("isConflict"),
+                    course_name: name.clone(),
                 });
             }
         }
-        Ok(out)
+        Ok(CatalogPage {
+            rows: out,
+            courses,
+            total,
+        })
     }
 
     /// 写请求的报文体（首发、重试、错开发都共用这一份，字段与前端提交的一致）。
@@ -962,8 +999,15 @@ impl School {
     }
 
     /// 把整个 HTTP 请求预序列化成字节，放课瞬间直接 write（对应原版 `build_wire`）。
-    pub fn build_wire(&self, code: &str, batch: &str, tc_id: &str, campus: &str) -> Vec<u8> {
-        let body = self.submit_body(tc_id, code, batch, campus, None);
+    pub fn build_wire(
+        &self,
+        code: &str,
+        batch: &str,
+        tc_id: &str,
+        campus: &str,
+        tc_type: Option<&str>,
+    ) -> Vec<u8> {
+        let body = self.submit_body(tc_id, code, batch, campus, tc_type);
         let s = self.session();
         let head = [
             format!("POST {} HTTP/1.1", self.ep.path("volunteer")),
@@ -988,6 +1032,19 @@ impl School {
     }
 }
 
+/// 目录查询每页取多少条（前端也是 50）。
+pub const PAGE_SIZE: i64 = 50;
+
+/// 目录的一页。
+pub struct CatalogPage {
+    pub rows: Vec<CatalogRow>,
+    /// 这一页返回了几门课（`dataList` 的长度）。**不是**教学班数 ——
+    /// 判断"还有没有下一页"只能看这个，服务端给的 `totalCount` 也是课程数。
+    pub courses: usize,
+    /// 这类课一共几门；服务端没给就是 -1
+    pub total: i64,
+}
+
 pub struct CatalogRow {
     pub tc_id: String,
     pub index: String,
@@ -997,6 +1054,8 @@ pub struct CatalogRow {
     pub credit: String,
     pub is_full: String,
     pub is_conflict: String,
+    /// 课程名（界面上按名字筛/显示要用）
+    pub course_name: String,
 }
 
 fn non_empty(s: String, fallback: &str) -> String {
@@ -1528,7 +1587,7 @@ fn settle(school: &Arc<School>, code: &str, tc_id: &str, state: &Arc<State>) {
 /// 这里只检测、只报警、只停机 —— 绝不自动退课，退课必须由人来做决定。
 fn audit_parallel(
     school: &Arc<School>,
-    candidates: &[(String, String)],
+    candidates: &[Target],
     state: &Arc<State>,
     before: &HashSet<String>,
 ) -> Vec<String> {
@@ -1545,14 +1604,14 @@ fn audit_parallel(
     let label = |tc: &str| -> String {
         candidates
             .iter()
-            .find(|(t, _)| t == tc)
-            .map(|(_, l)| l.clone())
+            .find(|t| t.tc == tc)
+            .map(|t| t.label.clone())
             .unwrap_or_default()
     };
     let got: Vec<String> = candidates
         .iter()
-        .filter(|(tc, _)| now_ids.contains(tc) && !before.contains(tc))
-        .map(|(tc, _)| tc.clone())
+        .filter(|t| now_ids.contains(&t.tc) && !before.contains(&t.tc))
+        .map(|t| t.tc.clone())
         .collect();
     if got.len() > 1 {
         log::blank();
@@ -1582,10 +1641,37 @@ fn audit_parallel(
 // 重试循环
 // ==========================================================================
 
+/// 本次要打的一个候选：教学班 + 用哪一类（`teachingClassType`）提交。
+///
+/// 类型细化到候选这一级，是因为用户可能同时勾了不同类别的课（方案内一门 + 方案外一门），
+/// 而**提交报文里的类型必须和那门课的类别一致**，否则学校不认。
+/// `tc_type` 为 `None` 时用配置里的 `course.class_type`。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Target {
+    pub tc: String,
+    pub label: String,
+    pub tc_type: Option<String>,
+}
+
+impl Target {
+    pub fn new(tc: impl Into<String>, label: impl Into<String>) -> Target {
+        Target {
+            tc: tc.into(),
+            label: label.into(),
+            tc_type: None,
+        }
+    }
+
+    /// 提交这份报文时用的类型；`None` = 交给 `Endpoints.class_type`。
+    pub fn wire_type(&self) -> Option<&str> {
+        self.tc_type.as_deref().filter(|s| !s.is_empty())
+    }
+}
+
 #[derive(Clone)]
 pub struct Group {
     pub name: String,
-    pub members: Vec<(String, String)>,
+    pub members: Vec<Target>,
 }
 
 /// 一轮最多 N 个班：各自独立短连接，前一发**响应回来**（或等满 overlap_wait）再发下一发。
@@ -1605,7 +1691,7 @@ pub fn fire_round(
     code: &str,
     batch: &str,
     campus: &str,
-    targets: &[String],
+    targets: &[Target],
     timeout: Option<f64>,
     overlap_wait: f64,
 ) -> Vec<(String, WriteResult)> {
@@ -1613,11 +1699,12 @@ pub fn fire_round(
     let mut started = 0usize;
     std::thread::scope(|scope| {
         let (tx, rx) = mpsc::channel::<(String, WriteResult)>();
-        for tc in targets {
+        for t in targets {
             let tx = tx.clone();
+            let t = t.clone();
             scope.spawn(move || {
-                let res = school.submit_fresh(code, batch, tc, campus, None, timeout);
-                let _ = tx.send((tc.clone(), res));
+                let res = school.submit_fresh(code, batch, &t.tc, campus, t.wire_type(), timeout);
+                let _ = tx.send((t.tc.clone(), res));
             });
             started += 1;
             // 等这一发的**响应**回来（最多等 overlap_wait 秒）——注意是"等响应"，
@@ -1694,7 +1781,7 @@ pub fn retry_loop(
             break;
         }
         let blocked = state.blocked_ids();
-        if group.members.iter().all(|(tc, _)| blocked.contains(tc)) {
+        if group.members.iter().all(|t| blocked.contains(&t.tc)) {
             continue;
         }
         info(&format!(
@@ -1703,15 +1790,15 @@ pub fn retry_loop(
             group
                 .members
                 .iter()
-                .map(|(t, _)| tail(t, 3))
+                .map(|t| tail(&t.tc, 3))
                 .collect::<Vec<_>>()
         ));
         while timeutil::unix_now() < deadline && !state.is_done() && !state.stopped() {
             let blocked = state.blocked_ids();
-            let pool: Vec<(String, String)> = group
+            let pool: Vec<Target> = group
                 .members
                 .iter()
-                .filter(|(tc, _)| !blocked.contains(tc))
+                .filter(|t| !blocked.contains(&t.tc))
                 .cloned()
                 .collect();
             if pool.is_empty() {
@@ -1741,15 +1828,15 @@ pub fn retry_loop(
             // 先挑出本轮要打的候选。爆发期直接用提交当探针（抢的就是那几百毫秒）；
             // 之后就先用只读的 capacity.do 探一下，没空位就不发写请求 ——
             // 这样脚本可以整晚挂着捡漏，而不会把账号打成风控。
-            let mut picks: Vec<(String, String)> = Vec::new();
-            for (tc, lab) in &pool {
+            let mut picks: Vec<Target> = Vec::new();
+            for t in &pool {
                 if picks.len() >= 3 {
                     break;
                 }
-                if !in_burst && has_slot(&school, tc, &batch) == Some(false) {
+                if !in_burst && has_slot(&school, &t.tc, &batch) == Some(false) {
                     continue;
                 }
-                picks.push((tc.clone(), lab.clone()));
+                picks.push(t.clone());
             }
             if outage_since > 0.0 && !picks.is_empty() {
                 // 服务端在初始化：多打没意义（每发都会被拒），但必须保持试探而且要快 ——
@@ -1777,29 +1864,29 @@ pub fn retry_loop(
             // 爆发期并发错开发（谁也拖不死谁）；爆发期之后回归一连接顺序发 ——
             // 那时是"挂着捡漏"，慢一点无所谓，串行还能把双选的可能性再压一档。
             let res: Vec<(String, WriteResult)> = if in_burst && picks.len() > 1 {
-                let targets: Vec<String> = picks.iter().map(|(tc, _)| tc.clone()).collect();
                 fire_round(
                     &school,
                     &code,
                     &batch,
                     &campus,
-                    &targets,
+                    &picks,
                     Some(wt),
                     overlap_wait,
                 )
             } else {
                 picks
                     .iter()
-                    .map(|(tc, _)| {
+                    .map(|t| {
                         (
-                            tc.clone(),
-                            school.submit(&code, &batch, tc, &campus, None, Some(wt)),
+                            t.tc.clone(),
+                            school.submit(&code, &batch, &t.tc, &campus, t.wire_type(), Some(wt)),
                         )
                     })
                     .collect()
             };
 
-            for (tc, lab) in &picks {
+            for t in &picks {
+                let (tc, lab) = (&t.tc, &t.label);
                 if state.is_done() || state.stopped() {
                     break;
                 }
@@ -1933,17 +2020,12 @@ pub fn retry_loop(
 // 主流程
 // ==========================================================================
 
-fn summarize(
-    state: &State,
-    candidates: &[(String, String)],
-    relogins: u32,
-    pacer: &WritePacer,
-) -> u8 {
+fn summarize(state: &State, candidates: &[Target], relogins: u32, pacer: &WritePacer) -> u8 {
     let label = |tc: &str| -> String {
         candidates
             .iter()
-            .find(|(t, _)| t == tc)
-            .map(|(_, l)| l.clone())
+            .find(|t| t.tc == tc)
+            .map(|t| t.label.clone())
             .unwrap_or_default()
     };
     log::blank();
@@ -2530,7 +2612,8 @@ pub fn main(mut args: Args) -> Result<u8, String> {
     let catalog = if late {
         Vec::new()
     } else {
-        match school.catalog_candidates(&code, &batch, &campus, &keyword) {
+        let tc_type = ep.class_type.clone();
+        match school.catalog_candidates(&code, &batch, &campus, &keyword, &tc_type) {
             Ok(c) => c,
             Err(e) => {
                 log::log(&format!(
@@ -2563,10 +2646,14 @@ pub fn main(mut args: Args) -> Result<u8, String> {
 
     // 白名单：优先用 --priority，否则用默认优先级；目录只用于校验与展示
     // group_of: 教学班 -> 冲突组（星期-节次），用来决定哪些候选可以并发
-    let builtin_labels: Vec<(String, String)> = ep
+    let builtin_labels: Vec<Target> = ep
         .candidates
         .iter()
-        .map(|c: &Candidate| (c.id.clone(), c.label.clone()))
+        .map(|c: &Candidate| Target {
+            tc: c.id.clone(),
+            label: c.label.clone(),
+            tc_type: c.tc_type.clone(),
+        })
         .collect();
     let mut group_of: Vec<(String, String)> = ep
         .candidates
@@ -2582,26 +2669,26 @@ pub fn main(mut args: Args) -> Result<u8, String> {
     let lookup_label = |tc: &str| -> String {
         builtin_labels
             .iter()
-            .find(|(id, _)| id == tc)
-            .map(|(_, l)| l.clone())
+            .find(|t| t.tc == tc)
+            .map(|t| t.label.clone())
             .unwrap_or_else(|| tc.to_string())
     };
 
-    let mut candidates: Vec<(String, String)> = if let Some(priority) = &args.priority {
+    let mut candidates: Vec<Target> = if let Some(priority) = &args.priority {
         let mut wanted: Vec<String> = Vec::new();
         for item in priority
             .split(',')
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
         {
-            if builtin_labels.iter().any(|(id, _)| id == item) {
+            if builtin_labels.iter().any(|t| t.tc == item) {
                 wanted.push(item.to_string());
                 continue;
             }
             let hit: Vec<String> = builtin_labels
                 .iter()
-                .filter(|(id, _)| id.ends_with(item))
-                .map(|(id, _)| id.clone())
+                .filter(|t| t.tc.ends_with(item))
+                .map(|t| t.tc.clone())
                 .collect();
             match hit.len() {
                 0 => wanted.push(item.to_string()), // 表外的完整 ID，原样使用
@@ -2616,7 +2703,12 @@ pub fn main(mut args: Args) -> Result<u8, String> {
         }
         wanted
             .into_iter()
-            .map(|tc| (tc.clone(), lookup_label(&tc)))
+            .map(|tc| Target {
+                label: lookup_label(&tc),
+                tc,
+                // --priority 手写的 ID：不知道类别，交给配置里那个
+                tc_type: None,
+            })
             .collect()
     } else {
         builtin_labels.clone()
@@ -2626,14 +2718,14 @@ pub fn main(mut args: Args) -> Result<u8, String> {
         let allowed: HashSet<String> = catalog.iter().map(|c| c.tc_id.clone()).collect();
         let outside: Vec<String> = candidates
             .iter()
-            .filter(|(tc, _)| !allowed.contains(tc))
-            .map(|(tc, _)| tc.clone())
+            .filter(|t| !allowed.contains(&t.tc))
+            .map(|t| t.tc.clone())
             .collect();
         if !outside.is_empty() {
             log::log(&format!(
                 "⚠ 以下教学班不在本次目录白名单里，已剔除: {outside:?}"
             ));
-            candidates.retain(|(tc, _)| allowed.contains(tc));
+            candidates.retain(|t| allowed.contains(&t.tc));
         }
     }
     if candidates.is_empty() {
@@ -2644,18 +2736,18 @@ pub fn main(mut args: Args) -> Result<u8, String> {
     // 按冲突组切分，保持优先级顺序。组内互相冲突（最多中一个），组间必须串行，
     // 否则周三的班和周五的班可能同时选上 —— 这是脚本要极力避免的双选。
     let mut groups: Vec<Group> = Vec::new();
-    for (tc, lab) in &candidates {
+    for t in &candidates {
         let g = group_of
             .iter()
-            .find(|(id, _)| id == tc)
+            .find(|(id, _)| id == &t.tc)
             .map(|(_, g)| g.clone())
             .filter(|g| !g.is_empty())
-            .unwrap_or_else(|| tc.clone()); // 时段未知就各自成组（最保守）
+            .unwrap_or_else(|| t.tc.clone()); // 时段未知就各自成组（最保守）
         match groups.iter_mut().find(|grp| grp.name == g) {
-            Some(grp) => grp.members.push((tc.clone(), lab.clone())),
+            Some(grp) => grp.members.push(t.clone()),
             None => groups.push(Group {
                 name: g,
-                members: vec![(tc.clone(), lab.clone())],
+                members: vec![t.clone()],
             }),
         }
     }
@@ -2666,14 +2758,15 @@ pub fn main(mut args: Args) -> Result<u8, String> {
                 grp.name,
                 grp.members
                     .iter()
-                    .map(|(t, _)| tail(t, 3))
+                    .map(|t| tail(&t.tc, 3))
                     .collect::<Vec<_>>()
             ));
         }
     }
 
     // 硬保护 1：目标已在已选列表 -> 直接退出，绝不重复提交
-    for (tc, _lab) in &candidates {
+    for t in &candidates {
+        let tc = &t.tc;
         if enrolled.contains(tc) {
             log::log(&format!(
                 "\n✓ 教学班 {tc} 已在你的已选课程里 —— 无需抢课，脚本不做任何提交。"
@@ -2687,7 +2780,8 @@ pub fn main(mut args: Args) -> Result<u8, String> {
         if late { "（已过点，跳过）" } else { "" }
     ));
     if !late {
-        for (tc, lab) in &candidates {
+        for t in &candidates {
+            let (tc, lab) = (&t.tc, &t.label);
             match school.capacity(tc, &batch) {
                 Ok(cap) => {
                     let main_txt = format!(
@@ -2854,11 +2948,7 @@ pub fn main(mut args: Args) -> Result<u8, String> {
         width = width.max((conns as usize).min(3));
     }
     width = width.min(3).min(top_group.len()).max(1);
-    let volley: Vec<String> = top_group
-        .iter()
-        .take(width)
-        .map(|(tc, _)| tc.clone())
-        .collect();
+    let volley: Vec<Target> = top_group.iter().take(width).cloned().collect();
 
     // **错开**发，而不是同时发：实测（concurrent_probe，3/3 复现）
     //   3 发同一瞬间出去 → 只有 1 发拿到真正的业务回复，另外 2 发是 code=2 且 msg 为空的
@@ -2868,10 +2958,10 @@ pub fn main(mut args: Args) -> Result<u8, String> {
     let plans: Vec<(Vec<u8>, String, f64)> = volley
         .iter()
         .enumerate()
-        .map(|(i, tc)| {
+        .map(|(i, t)| {
             (
-                school.build_wire(&code, &batch, tc, &campus),
-                tc.clone(),
+                school.build_wire(&code, &batch, &t.tc, &campus, t.wire_type()),
+                t.tc.clone(),
                 fire_at + i as f64 * args.stagger,
             )
         })
@@ -2879,7 +2969,7 @@ pub fn main(mut args: Args) -> Result<u8, String> {
     info(&format!(
         "  首发 {} 发（硬上限 3）→ {:?}{}",
         plans.len(),
-        volley.iter().map(|t| tail(t, 3)).collect::<Vec<_>>(),
+        volley.iter().map(|t| tail(&t.tc, 3)).collect::<Vec<_>>(),
         if plans.len() > 1 {
             format!("，彼此错开 {:.0}ms", args.stagger * 1000.0)
         } else {
@@ -3151,8 +3241,9 @@ mod tests {
             4.0,
             None,
         );
-        let wire = String::from_utf8_lossy(&school.build_wire("2026000000", "B1", "TC1", "01"))
-            .into_owned();
+        let wire =
+            String::from_utf8_lossy(&school.build_wire("2026000000", "B1", "TC1", "01", None))
+                .into_owned();
         assert!(wire.starts_with("POST /api/elective/volunteer.do HTTP/1.1\r\n"));
         assert!(wire.contains("token: tok-abc\r\n"));
         assert!(wire.contains("Connection: keep-alive\r\n"));

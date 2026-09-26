@@ -54,7 +54,33 @@ pub enum Mode {
     /// 用分块编码（Transfer-Encoding: chunked）回响应 —— Java 后端很可能会这么回，
     /// 而我们这套 HTTP 读取器是自己写的，必须验证分块能正确读完
     Chunked,
+    /// 学生状态里带选课批次、课程目录里有教学班 —— 给「开荒」用：
+    /// 登录 → 读批次 → 查目录 → 挑候选，这条链路要走通
+    Catalog,
+    /// 课程目录**只**在 `teachingClassType=FANKC`（方案内课程）下有结果
+    OnlyInPlan,
+    /// 每一类都回一点东西，而且**分两页** —— 验证"每一类都拉、按 totalCount 翻页"
+    ByCategory,
+    /// 有批次，但目录是空的 —— 不是选课时间时就是这样
+    EmptyCatalog,
 }
+
+/// 一份课程目录响应：一门「测试课程」，三个教学班（其中一个上课地点没写星期节次）。
+const CATALOG_JSON: &str = r#"{"code":"1","data":{"campus":"01"},"dataList":[
+     {"courseName":"测试课程","courseNumber":"TS100","credit":"3.0","tcList":[
+        {"teachingClassID":"000000000000000000000101","courseIndex":"01",
+         "teacherName":"张老师","teachingPlace":"星期一第3-5节 一教101",
+         "isFull":"0","isConflict":"0"},
+        {"teachingClassID":"000000000000000000000102","courseIndex":"02",
+         "teacherName":"李老师","teachingPlace":"星期三第3-5节 二教202",
+         "isFull":"1","isConflict":"0"},
+        {"teachingClassID":"000000000000000000000103","courseIndex":"03",
+         "teacherName":"王老师","teachingPlace":"待定",
+         "isFull":"0","isConflict":"1"}]},
+     {"courseName":"别的课","courseNumber":"XX200","credit":"2.0","tcList":[
+        {"teachingClassID":"000000000000000000000999","courseIndex":"01",
+         "teacherName":"不该出现","teachingPlace":"星期一第1-2节"}]}
+   ]}"#;
 
 pub struct Mock {
     pub port: u16,
@@ -192,11 +218,76 @@ fn serve(
                     json(&format!(r#"{{"code":"{code}","msg":"{msg}"}}"#))
                 }
             }
+        } else if path_only == "/" {
+            // 真实系统就是这么干的：根路径 302 到应用页。配置界面靠这一跳做到"只粘域名"。
+            let head = format!(
+                "HTTP/1.1 302 Found\r\nLocation: /api/*default/index.do\r\nContent-Length: 0\r\nDate: {}\r\nConnection: keep-alive\r\n\r\n",
+                http_date()
+            );
+            let _ = stream.write_all(head.as_bytes());
+            continue;
         } else if method == "GET" && path_only.ends_with("image.do") {
             cookies.push("route=r1; Path=/".to_string());
             cookies.push("insert_cookie=ic1; Path=/".to_string());
             respond(&mut stream, 200, "image/jpeg", FAKE_JPEG, &cookies);
             continue;
+        } else if matches!(
+            mode,
+            Mode::Catalog | Mode::OnlyInPlan | Mode::ByCategory | Mode::EmptyCatalog
+        ) && path_only.contains("/student/")
+        {
+            // 学生状态里带着"当前选课批次"和"校区" —— 查课程目录要用这两个
+            json(
+                r#"{"code":"1","data":{"campus":"01",
+                     "electiveBatch":{"code":"B1","name":"正选","typeName":"正选","tacticName":"先到先得"}},
+                     "dataList":[]}"#,
+            )
+        } else if mode == Mode::Catalog && path_only.ends_with("programCourse.do") {
+            json(CATALOG_JSON)
+        } else if mode == Mode::EmptyCatalog && path_only.ends_with("programCourse.do") {
+            json(r#"{"code":"1","data":{"campus":"01"},"totalCount":"0","dataList":[]}"#)
+        } else if mode == Mode::ByCategory && path_only.ends_with("programCourse.do") {
+            // 从 querySetting 里抠出类别与页码：每一类回 2 个教学班、分两页
+            let q = form
+                .iter()
+                .find(|(k, _)| k == "querySetting")
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default();
+            let field = |name: &str| -> String {
+                q.split(&format!("\"{name}\":\""))
+                    .nth(1)
+                    .and_then(|r| r.split('"').next())
+                    .unwrap_or("")
+                    .to_string()
+            };
+            let tc_type = field("teachingClassType");
+            let page: i64 = field("pageNumber").parse().unwrap_or(0);
+            // 55 门课分两页：第一页满 50、第二页 5 —— 真实服务端就是这么发的
+            const TOTAL: i64 = 55;
+            let start = page * 50;
+            if start >= TOTAL {
+                json(&format!(
+                    r#"{{"code":"1","data":{{"campus":"01"}},"totalCount":"{TOTAL}","dataList":[]}}"#
+                ))
+            } else {
+                let n = (TOTAL - start).min(50);
+                let mut items = String::new();
+                for i in 0..n {
+                    let k = start + i;
+                    if i > 0 {
+                        items.push(',');
+                    }
+                    items.push_str(&format!(
+                        r#"{{"courseName":"课程{k}","courseNumber":"C{k}","credit":"3.0","tcList":[
+                            {{"teachingClassID":"ID-{tc_type}-{k}","courseIndex":"01",
+                              "teacherName":"老师{tc_type}","teachingPlace":"星期三第3-5节 一教101",
+                              "isFull":"0","isConflict":"0"}}]}}"#
+                    ));
+                }
+                json(&format!(
+                    r#"{{"code":"1","data":{{"campus":"01"}},"totalCount":"{TOTAL}","dataList":[{items}]}}"#
+                ))
+            }
         } else if mode == Mode::GuardSession && !cookie.contains("JSESSIONID=S1") {
             json(r#"{"code":"302","msg":"未登录用户"}"#)
         } else if method == "POST" && path_only.ends_with("volunteer.do") {

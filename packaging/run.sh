@@ -11,10 +11,20 @@ BIN=./course-grabber
 if [ ! -f config.json ]; then
   "$BIN" --offline || true
   echo "=============================================================="
-  echo " 请填上你学校的域名、接口路径与候选教学班："
+  echo " 最省事：跑配置界面，照里面的「三步向导」走。"
+  echo ""
+  echo "     $BIN tui"
+  echo ""
+  echo "   ① 粘一条选课页网址（浏览器里 Ctrl-L 全选地址栏、Ctrl-C）"
+  echo "      —— 域名、接口前缀、页面路径会自动填好"
+  echo "   ② 填学号密码（用来自动登录；界面里保存就是 0600）"
+  echo "   ③ 让程序登录把课程目录拉下来，空格勾选候选教学班"
+  echo "   三步做完按 s 保存，按 q 退出。"
+  echo ""
+  echo " 不想用界面也行，手写 config.json（填域名、接口路径与候选教学班）："
   echo "     \${EDITOR:-vi} $(pwd)/config.json"
   echo ""
-  echo " 想用自动登录的话，再准备凭据文件（0600）："
+  echo " 凭据文件（用自动登录的话，0600 —— 界面里填就不用手工建）："
   echo "     mkdir -p ~/.config/course-grabber"
   echo "     cat > ~/.config/course-grabber/credentials.json <<'JSON'"
   echo '     {"student_id": "你的学号", "password": "你的密码"}'

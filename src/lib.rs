@@ -14,6 +14,7 @@
 //! | `grab.rs` | `grab.py` —— 预检、对时、首发、重试循环、复核 |
 //! | `des.rs` | `desencode.py` + `cus_base64.py` —— 密码加密 |
 //! | `captcha.rs` | 原版的 `python/solver.py` + `libccm.so`（现在是编译进来的依赖） |
+//! | `tui.rs` | 原版没有 —— 手写 config.json 太容易错，这是新增的配置编辑器 |
 //!
 //! 原版里还有、这里**没有**的东西：
 //! * PyInstaller 打包脚本（不再需要：`cargo build --release` 就是一个文件）
@@ -32,5 +33,9 @@ pub mod httpc;
 pub mod json;
 pub mod lock;
 pub mod log;
+pub mod onboard;
 pub mod pacer;
+pub mod term;
+pub mod textw;
 pub mod timeutil;
+pub mod tui;

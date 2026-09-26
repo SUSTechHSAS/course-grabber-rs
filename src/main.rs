@@ -5,7 +5,7 @@
 
 use std::process::ExitCode;
 
-use course_grabber::{cli, grab, log};
+use course_grabber::{cli, grab, log, tui};
 
 fn main() -> ExitCode {
     // `course-grabber --offline | head` 这种用法会把管道提前关掉。
@@ -23,6 +23,19 @@ fn main() -> ExitCode {
         Ok(cli::Parsed::Print(text)) => {
             print!("{text}");
             return ExitCode::SUCCESS;
+        }
+        // 配置界面：在跑抢课流程之前就分流，它不碰锁、不读满配置、也不联网
+        Ok(cli::Parsed::Tui(opts)) => {
+            return match tui::run(tui::Opts {
+                config: opts.config,
+                credentials: opts.credentials,
+            }) {
+                Ok(code) => ExitCode::from(code),
+                Err(e) => {
+                    log::log(&format!("\n✗ {e}"));
+                    ExitCode::from(2)
+                }
+            }
         }
         Err(msg) => {
             eprint!("{msg}");

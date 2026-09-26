@@ -44,6 +44,61 @@ impl Json {
         }
     }
 
+    // ---------------------------------------------------------------
+    // 就地修改（TUI 改配置、开荒填配置都用这一套）
+    // ---------------------------------------------------------------
+
+    /// 写一个成员：有就覆盖，没有就追加（**不改变已有键的顺序**）。
+    pub fn set_key(&mut self, key: &str, val: Json) {
+        if let Json::Obj(pairs) = self {
+            match pairs.iter_mut().find(|(k, _)| k == key) {
+                Some((_, slot)) => *slot = val,
+                None => pairs.push((key.to_string(), val)),
+            }
+        }
+    }
+
+    /// 取 `self[key]`，不存在或类型不对就换成一个空对象。
+    ///
+    /// "类型不对也换掉"是故意的：配置文件被手写坏了（`"school": "x"`）时，
+    /// 用户应该能在界面里把它改回来，而不是只能看着报错去翻文件。
+    pub fn ensure_obj(&mut self, key: &str) -> &mut Json {
+        if !matches!(self, Json::Obj(_)) {
+            *self = Json::Obj(Vec::new());
+        }
+        if let Json::Obj(pairs) = self {
+            if !pairs.iter().any(|(k, _)| k == key) {
+                pairs.push((key.to_string(), Json::Obj(Vec::new())));
+            }
+            let idx = pairs.iter().position(|(k, _)| k == key).unwrap_or(0);
+            if !matches!(pairs[idx].1, Json::Obj(_)) {
+                pairs[idx].1 = Json::Obj(Vec::new());
+            }
+            return &mut pairs[idx].1;
+        }
+        unreachable!("上面已经保证是对象了")
+    }
+
+    /// 同上，但保证是个数组。
+    pub fn ensure_arr(&mut self, key: &str) -> &mut Vec<Json> {
+        if !matches!(self, Json::Obj(_)) {
+            *self = Json::Obj(Vec::new());
+        }
+        if let Json::Obj(pairs) = self {
+            if !pairs.iter().any(|(k, _)| k == key) {
+                pairs.push((key.to_string(), Json::Arr(Vec::new())));
+            }
+            let idx = pairs.iter().position(|(k, _)| k == key).unwrap_or(0);
+            if !matches!(pairs[idx].1, Json::Arr(_)) {
+                pairs[idx].1 = Json::Arr(Vec::new());
+            }
+            if let Json::Arr(a) = &mut pairs[idx].1 {
+                return a;
+            }
+        }
+        unreachable!("上面已经保证是数组了")
+    }
+
     /// `payload.get(k) or []` —— 缺键/类型不对都当成空数组
     pub fn array(&self, key: &str) -> &[Json] {
         match self.get(key) {
@@ -129,6 +184,54 @@ impl Json {
         let mut out = String::with_capacity(64);
         self.write_compact(&mut out);
         out
+    }
+
+    /// 缩进形式（2 空格）。给 TUI 写 config.json / credentials.json 用 ——
+    /// 那份文件用户还会拿编辑器打开，跟 `config.example.json` 一个风格才看得下去。
+    pub fn to_pretty(&self) -> String {
+        let mut out = String::with_capacity(256);
+        self.write_pretty(&mut out, 0);
+        out
+    }
+
+    fn write_pretty(&self, out: &mut String, depth: usize) {
+        let pad = |out: &mut String, d: usize| {
+            for _ in 0..d {
+                out.push_str("  ");
+            }
+        };
+        match self {
+            Json::Arr(items) if !items.is_empty() => {
+                out.push_str("[\n");
+                for (i, v) in items.iter().enumerate() {
+                    pad(out, depth + 1);
+                    v.write_pretty(out, depth + 1);
+                    if i + 1 < items.len() {
+                        out.push(',');
+                    }
+                    out.push('\n');
+                }
+                pad(out, depth);
+                out.push(']');
+            }
+            Json::Obj(pairs) if !pairs.is_empty() => {
+                out.push_str("{\n");
+                for (i, (k, v)) in pairs.iter().enumerate() {
+                    pad(out, depth + 1);
+                    write_json_string(k, out);
+                    out.push_str(": ");
+                    v.write_pretty(out, depth + 1);
+                    if i + 1 < pairs.len() {
+                        out.push(',');
+                    }
+                    out.push('\n');
+                }
+                pad(out, depth);
+                out.push('}');
+            }
+            // 空对象/空数组、以及标量：紧凑形式就够
+            other => other.write_compact(out),
+        }
     }
 
     fn write_compact(&self, out: &mut String) {
@@ -546,5 +649,17 @@ mod tests {
         let raw = r#"{"a":[1,2,{"b":null}],"c":true,"d":-2.5}"#;
         let v = parse(raw).unwrap();
         assert_eq!(v.to_compact(), raw);
+    }
+
+    #[test]
+    fn pretty_print_round_trips_and_indents() {
+        let raw = r#"{"a":[1,2,{"b":null}],"c":{},"d":[],"e":"高等数学"}"#;
+        let v = parse(raw).unwrap();
+        let pretty = v.to_pretty();
+        assert!(pretty.contains("\n  \"a\": ["), "{pretty}");
+        assert!(pretty.contains("\"e\": \"高等数学\""), "{pretty}");
+        assert!(pretty.contains("\"c\": {}"), "{pretty}");
+        // 打印出来还得能读回去（TUI 保存完再读一遍就是这条路径）
+        assert_eq!(parse(&pretty).unwrap(), v);
     }
 }

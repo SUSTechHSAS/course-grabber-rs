@@ -49,6 +49,7 @@
   "course": {
     "_comment": "目标课程与候选教学班。group 是冲突组（星期-节次），同组互相冲突、最多中一个；跨组会串行提交。",
     "keyword": "高等数学",
+    "_class_type": "选课类型（teachingClassType）。它决定服务器回哪一类课，提交选课也要带同一个值 —— 填错的表现是「目录里查不到这门课」或「提交了但学校不认」。常见的：FANKC=方案内课程（必修课多在这里）· FAWKC=方案外课程 · XGXK=校公选课 · TYKC=体育课程 · MOOC=慕课（还要在 query_content 里带 MOOC:2, 才查得到）",
     "class_type": "FAWKC",
     "campus": "",
     "candidates": [
