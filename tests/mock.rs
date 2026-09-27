@@ -24,6 +24,9 @@ pub struct Call {
     pub path: String,
     pub form: Vec<(String, String)>,
     pub cookie: String,
+    /// 这条请求到达的时刻（相对 `Mock::start` 时的 t0）。
+    /// 常驻轮询的节奏（`--poll`）与"什么时候才开始问第二个组"都要靠它断言。
+    pub at: f64,
 }
 
 impl Call {
@@ -71,6 +74,11 @@ pub enum Mode {
     /// 2026-09-27 的实战：脚本于是安静地只读轮询，"停机结束"这个状态再也没被认出来 ——
     /// 见 `grab.rs` 里那段"第二冲突组整晚一发没试"的注释。
     OutageThenFull,
+    /// 一直是满的 —— 常驻轮询的常态：只读轮询、一发写请求都不发。
+    AlwaysFull,
+    /// 提交什么就"选中"什么：`courseResult.do` 会把提交过的教学班报成已选，
+    /// 于是 `settle()` 的复核能真的确认选中。给"抢到一门继续抢下一门""不双选"用。
+    AlwaysWin,
 }
 
 /// `Mode::OutageThenFull` 的停机时长（秒）。
@@ -105,6 +113,8 @@ pub struct Mock {
     pub calls: Arc<Mutex<Vec<Call>>>,
     /// 写请求（volunteer.do）到达的时刻，相对 `t0`
     pub writes: Arc<Mutex<Vec<f64>>>,
+    /// 写请求里提交过的教学班 ID（按提交顺序）
+    pub submitted: Arc<Mutex<Vec<String>>>,
     pub t0: Instant,
     script: Arc<Mutex<VecDeque<LoginReply>>>,
     stop: Arc<AtomicBool>,
@@ -118,6 +128,7 @@ impl Mock {
         let port = listener.local_addr().unwrap().port();
         let calls = Arc::new(Mutex::new(Vec::new()));
         let writes = Arc::new(Mutex::new(Vec::new()));
+        let submitted = Arc::new(Mutex::new(Vec::new()));
         let script = Arc::new(Mutex::new(script.into_iter().collect::<VecDeque<_>>()));
         let stop = Arc::new(AtomicBool::new(false));
         let t0 = Instant::now();
@@ -125,6 +136,7 @@ impl Mock {
         let accept = {
             let calls = Arc::clone(&calls);
             let writes = Arc::clone(&writes);
+            let submitted = Arc::clone(&submitted);
             let script = Arc::clone(&script);
             let stop = Arc::clone(&stop);
             std::thread::spawn(move || {
@@ -133,9 +145,10 @@ impl Mock {
                         Ok((stream, _)) => {
                             let calls = Arc::clone(&calls);
                             let writes = Arc::clone(&writes);
+                            let submitted = Arc::clone(&submitted);
                             let script = Arc::clone(&script);
                             std::thread::spawn(move || {
-                                serve(stream, mode, calls, writes, script, t0)
+                                serve(stream, mode, calls, writes, submitted, script, t0)
                             });
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -151,6 +164,7 @@ impl Mock {
             port,
             calls,
             writes,
+            submitted,
             t0,
             script,
             stop,
@@ -191,6 +205,7 @@ fn serve(
     mode: Mode,
     calls: Arc<Mutex<Vec<Call>>>,
     writes: Arc<Mutex<Vec<f64>>>,
+    submitted: Arc<Mutex<Vec<String>>>,
     script: Arc<Mutex<VecDeque<LoginReply>>>,
     t0: Instant,
 ) {
@@ -212,6 +227,7 @@ fn serve(
             path: path_only.clone(),
             form: form.clone(),
             cookie: cookie.clone(),
+            at: t0.elapsed().as_secs_f64(),
         });
 
         let mut cookies: Vec<String> = Vec::new();
@@ -322,11 +338,29 @@ fn serve(
             }
             json(r#"{"code":"0","msg":"请求数据与登录者身份不一致，非法请求。"}"#)
         } else if method == "POST" && path_only.ends_with("volunteer.do") {
-            // 写请求在任何模式下都要记账（自检要能断言"发了几发"）
+            // 写请求在任何模式下都要记账（自检要能断言"发了几发"、发的是哪个班）
             writes.lock().unwrap().push(t0.elapsed().as_secs_f64());
+            let add = form
+                .iter()
+                .find(|(k, _)| k == "addParam")
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default();
+            if let Some(i) = add.find("teachingClassId") {
+                let id: String = add[i + "teachingClassId".len()..]
+                    .chars()
+                    .skip_while(|c| !c.is_ascii_alphanumeric())
+                    .take_while(|c| c.is_ascii_alphanumeric())
+                    .collect();
+                if !id.is_empty() {
+                    submitted.lock().unwrap().push(id);
+                }
+            }
             let in_outage = mode == Mode::InitOutage
                 || (mode == Mode::OutageThenFull && t0.elapsed().as_secs_f64() < OUTAGE_ENDS);
-            if in_outage {
+            if mode == Mode::AlwaysFull {
+                // 满员：写请求会被业务性地拒掉（可重试）
+                json(r#"{"code":"0","msg":"该课程超过课容量"}"#)
+            } else if in_outage {
                 // 真实措辞：放课瞬间学校就是这个状态，而且**它被算作可重试**
                 json(r#"{"code":"0","msg":"选课系统正在初始化,请稍候..."}"#)
             } else {
@@ -335,6 +369,23 @@ fn serve(
         } else if mode == Mode::InitOutage && path_only.ends_with("capacity.do") {
             // 初始化中的真实行为：没有数据，返回 0/0
             json(r#"{"code":"1","data":{"nonMainClassCapacity":"0","nonMainElectiveNumber":"0"}}"#)
+        } else if mode == Mode::AlwaysFull && path_only.ends_with("capacity.do") {
+            // 一直是满的（非主选 2/2）—— 常驻轮询的常态
+            json(r#"{"code":"1","data":{"nonMainClassCapacity":"2","nonMainElectiveNumber":"2"}}"#)
+        } else if mode == Mode::AlwaysWin && path_only.ends_with("capacity.do") {
+            // 一直有空位：脚本读到就会出手，于是能验证"抢到之后"的行为
+            json(r#"{"code":"1","data":{"nonMainClassCapacity":"2","nonMainElectiveNumber":"0"}}"#)
+        } else if mode == Mode::AlwaysWin && path_only.ends_with("courseResult.do") {
+            // 提交过的都报成"已选" —— 让 settle() 的复核真的确认选中
+            let ids = submitted.lock().unwrap().clone();
+            let items: Vec<String> = ids
+                .iter()
+                .map(|id| format!(r#"{{"teachingClassID":"{id}"}}"#))
+                .collect();
+            json(&format!(
+                r#"{{"code":"1","data":{{"campus":"01"}},"dataList":[{}]}}"#,
+                items.join(",")
+            ))
         } else if mode == Mode::OutageThenFull && path_only.ends_with("capacity.do") {
             if t0.elapsed().as_secs_f64() < OUTAGE_ENDS {
                 // 还在初始化：没有数据

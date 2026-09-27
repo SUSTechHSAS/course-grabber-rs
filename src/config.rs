@@ -234,11 +234,41 @@ pub struct Candidate {
     pub id: String,
     pub label: String,
     pub group: String,
-    /// 这门课属于哪一类（`teachingClassType`）。`None` = 用 `course.class_type`。
+    /// 这门课属于哪一类（`teachingClassType`）。`None` = 用所属课程的 `class_type`。
     ///
     /// 配置里可以给每个候选写 `"type": "FANKC"` —— 抢课时的提交报文必须带对类别，
-    /// 而一个配置里可能同时有方案内和方案外的课（配置界面就是这么写回来的）。
+    /// 而一个课程里可能同时有方案内和方案外的班（配置界面就是这么写回来的）。
     pub tc_type: Option<String>,
+    /// 这个候选项属于 `Endpoints.courses` 里的第几门课（0 起）。
+    ///
+    /// 抢到之后要"这门课就不再抢了"，而同一个时段的不同课程只能中一个 ——
+    /// 这两件事都要靠它来分辨。
+    pub course_idx: usize,
+}
+
+/// 一门目标课程：自己的关键词、类别、候选教学班。
+///
+/// 配置里写 `"courses": [ {...}, {...} ]`；老配置只写一个 `"course": {...}`
+/// 也照样读，等价于只有一门课。
+#[derive(Clone, Debug)]
+pub struct CourseCfg {
+    /// 界面上显示的名字。缺省就用 `keyword`。
+    pub name: String,
+    pub keyword: String,
+    pub class_type: String,
+    pub is_major: String,
+    pub query_content: String,
+    pub candidates: Vec<Candidate>,
+}
+
+impl CourseCfg {
+    pub fn display(&self) -> &str {
+        if self.name.is_empty() {
+            &self.keyword
+        } else {
+            &self.name
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -274,7 +304,13 @@ pub struct Endpoints {
     pub is_major: String,
     pub query_content: String,
     pub keyword: String,
+    /// 所有候选教学班（= `courses` 里各门课的候选按顺序拼接）。
+    ///
+    /// 刻意保持"扁平一份"：按 ID 过滤（`--priority`）、白名单、`--offline` 打印这些
+    /// 地方都只需要一份总表，不必关心它来自哪门课；要分辨课程就看 `Candidate.course_idx`。
     pub candidates: Vec<Candidate>,
+    /// 目标课程。至少一门；只有老配置（单个 `course` 对象）时就是那一门。
+    pub courses: Vec<CourseCfg>,
     pub captcha_width: i64,
     pub captcha_height: i64,
     pub captcha_min_margin: f64,
@@ -317,6 +353,73 @@ fn text_of(v: Option<&Json>, default: &str) -> String {
             }
         }
         None => default.to_string(),
+    }
+}
+
+/// 把老格式（单个 `course` 对象）搬进 `courses` 数组，两个都有时以 `courses` 为准。
+///
+/// `load()` 两种都认，但**改配置**的人（界面、开荒写回）只认 `courses` ——
+/// 不归一就会出现"表单是空的、保存时把 `course` 写回去，而程序读的却是 `courses`"。
+pub fn normalize_courses(raw: &mut Json) {
+    if !raw.array("courses").is_empty() {
+        raw.remove_key("course");
+        return;
+    }
+    let old = raw.get("course").cloned().unwrap_or(Json::Null);
+    let entry = if matches!(old, Json::Obj(_)) {
+        old
+    } else {
+        Json::Obj(Vec::new())
+    };
+    raw.set_key("courses", Json::Arr(vec![entry]));
+    raw.remove_key("course");
+}
+
+/// 解析一门课（`courses` 数组里的一项，或老配置里那个单独的 `course` 对象）。
+///
+/// 候选列表兼容两种写法：对象 `{"id":…, "label":…, "group":…}` 和数组
+/// `["id", "label", "group"]`（老配置里用过）。
+fn parse_course(obj: &Json, course_idx: usize) -> CourseCfg {
+    let keyword = text_of(obj.get("keyword"), "");
+    let name = text_of(obj.get("name"), "");
+    let mut candidates = Vec::new();
+    for item in obj.array("candidates") {
+        let (id, label, group, tc_type) = match item {
+            Json::Obj(_) => (
+                item.text("id"),
+                item.text("label"),
+                item.text("group"),
+                Some(item.text("type")).filter(|s| !s.trim().is_empty()),
+            ),
+            Json::Arr(parts) => (
+                parts.first().map(|v| v.as_text()).unwrap_or_default(),
+                parts.get(1).map(|v| v.as_text()).unwrap_or_default(),
+                parts.get(2).map(|v| v.as_text()).unwrap_or_default(),
+                None,
+            ),
+            _ => continue,
+        };
+        if !id.is_empty() {
+            candidates.push(Candidate {
+                id,
+                label,
+                group,
+                tc_type,
+                course_idx,
+            });
+        }
+    }
+    CourseCfg {
+        name: if name.is_empty() {
+            keyword.clone()
+        } else {
+            name
+        },
+        keyword,
+        class_type: text_of(obj.get("class_type"), ""),
+        is_major: text_of(obj.get("is_major"), "1"),
+        query_content: text_of(obj.get("query_content"), "{keyword}"),
+        candidates,
     }
 }
 
@@ -419,33 +522,23 @@ impl Config {
         let base_path = text_of(kind("base_path"), "");
         let base_path = base_path.trim_end_matches('/').to_string();
 
-        let mut candidates = Vec::new();
-        for item in course.array("candidates") {
-            let (id, label, group, tc_type) = match item {
-                Json::Obj(_) => (
-                    item.text("id"),
-                    item.text("label"),
-                    item.text("group"),
-                    Some(item.text("type")).filter(|s| !s.trim().is_empty()),
-                ),
-                Json::Arr(parts) => (
-                    parts.first().map(|v| v.as_text()).unwrap_or_default(),
-                    parts.get(1).map(|v| v.as_text()).unwrap_or_default(),
-                    parts.get(2).map(|v| v.as_text()).unwrap_or_default(),
-                    None,
-                ),
-                _ => continue,
-            };
-            if !id.is_empty() {
-                candidates.push(Candidate {
-                    id,
-                    label,
-                    group,
-                    tc_type,
-                });
+        // 目标课程：新格式是 `courses: [...]`，老格式是一个 `course: {...}`。
+        // 两个都有时以 `courses` 为准（并在启动横幅里说明，见 courses_from）。
+        let mut courses: Vec<CourseCfg> = Vec::new();
+        for item in self.raw.array("courses") {
+            if !matches!(item, Json::Obj(_)) {
+                continue;
             }
+            courses.push(parse_course(item, courses.len()));
         }
+        if courses.is_empty() {
+            courses.push(parse_course(&course, 0));
+        }
+        // 扁平总表：各门课的候选按课程顺序拼起来
+        let candidates: Vec<Candidate> =
+            courses.iter().flat_map(|c| c.candidates.clone()).collect();
 
+        let first = &courses[0];
         let page_path = text_of(kind("page_path"), "/");
         Ok(Endpoints {
             host: host.clone(),
@@ -465,11 +558,12 @@ impl Config {
             session_cookies: str_list_or(cookies.get("session"), &["JSESSIONID"]),
             captcha_cookies: str_list_or(cookies.get("captcha"), &["route", "insert_cookie"]),
             des_keys,
-            class_type: text_of(course.get("class_type"), ""),
-            is_major: text_of(course.get("is_major"), "1"),
-            query_content: text_of(course.get("query_content"), "{keyword}"),
-            keyword: text_of(course.get("keyword"), ""),
+            class_type: first.class_type.clone(),
+            is_major: first.is_major.clone(),
+            query_content: first.query_content.clone(),
+            keyword: first.keyword.clone(),
             candidates,
+            courses,
             captcha_width: captcha.get("width").and_then(|v| v.as_i64()).unwrap_or(250),
             captcha_height: captcha.get("height").and_then(|v| v.as_i64()).unwrap_or(80),
             captcha_min_margin: captcha
@@ -563,6 +657,70 @@ mod tests {
         assert_eq!(got.get("a").unwrap().get("c").unwrap().as_i64(), Some(9));
         assert_eq!(got.get("d").unwrap().as_i64(), Some(3));
         assert_eq!(got.get("e").unwrap().as_i64(), Some(5));
+    }
+
+    /// 多课程：`courses` 数组 / 老的单 `course` 对象 / 两个都有。
+    ///
+    /// 老配置原样能跑是硬要求（用户手上那份只有 `course`），所以这里三种都钉住。
+    #[test]
+    fn courses_parse_with_backward_compat() {
+        let ep = |extra: &str| -> Endpoints {
+            let text = format!(
+                r#"{{"school":{{"host":"h"}},"paths":{{"volunteer":"/v","capacity":"/c","result":"/r",
+                   "status":"/s","sysparam":"/y","program":"/p","student":"/st",
+                   "vcode_token":"/vt","vcode_image":"/vi","login":"/l"}},
+                   "password":{{"des_keys":["a","b","c"]}}{extra}}}"#
+            );
+            Config::from_raw(json::parse(&text).unwrap(), "test")
+                .endpoints()
+                .unwrap()
+        };
+
+        // ① 老格式：一个 course 对象 → 一门课，keyword/class_type 照旧
+        let e = ep(r#","course":{"keyword":"线代","class_type":"FAWKC","is_major":"0",
+                    "candidates":[{"id":"A1","label":"A班","group":"星期三-3-5"},
+                                  ["A2","B班","星期五-3-5"]]}"#);
+        assert_eq!(e.courses.len(), 1);
+        assert_eq!(e.courses[0].keyword, "线代");
+        assert_eq!(e.courses[0].class_type, "FAWKC");
+        assert_eq!(e.courses[0].display(), "线代", "没写 name 就用 keyword");
+        assert_eq!(e.keyword, "线代", "第一门课的键仍然拍平出来给老代码用");
+        assert_eq!(e.is_major, "0");
+        assert_eq!(e.candidates.len(), 2, "数组写法也要认");
+        assert!(e.candidates.iter().all(|c| c.course_idx == 0));
+
+        // ② 新格式：两门课 → 候选按课程顺序拼成一份总表，各自带着课程号
+        let e = ep(r#","courses":[
+                    {"name":"线性代数","keyword":"线代","class_type":"FAWKC",
+                     "candidates":[{"id":"A1","label":"A班","group":"星期三-3-5"}]},
+                    {"name":"大学物理","keyword":"大物","class_type":"FANKC","is_major":"1",
+                     "candidates":[{"id":"B1","label":"B班","group":"星期三-3-5"},
+                                   {"id":"B2","label":"C班","group":"星期四-3-5"}]}]"#);
+        assert_eq!(e.courses.len(), 2);
+        assert_eq!(e.courses[1].display(), "大学物理");
+        assert_eq!(e.courses[1].class_type, "FANKC");
+        assert_eq!(
+            e.candidates.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            vec!["A1", "B1", "B2"]
+        );
+        assert_eq!(
+            e.candidates.iter().map(|c| c.course_idx).collect::<Vec<_>>(),
+            vec![0, 1, 1]
+        );
+        // 两门课的候选落在同一个冲突组里 —— 多课程"不双选"就靠这个
+        assert_eq!(e.candidates[0].group, e.candidates[1].group);
+
+        // ③ 两个都有：以 courses 为准
+        let e = ep(r#","course":{"keyword":"旧的","candidates":[{"id":"OLD","group":"x"}]},
+                    "courses":[{"keyword":"新的","candidates":[{"id":"NEW","group":"y"}]}]"#);
+        assert_eq!(e.courses.len(), 1);
+        assert_eq!(e.keyword, "新的");
+        assert_eq!(e.candidates[0].id, "NEW");
+
+        // ④ 都没有：仍然是一份可用的空课程（预检会给出"没有候选"的提示）
+        let e = ep("");
+        assert_eq!(e.courses.len(), 1);
+        assert!(e.candidates.is_empty());
     }
 
     #[test]

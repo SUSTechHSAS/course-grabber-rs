@@ -682,8 +682,6 @@ pub fn fill_reference(raw: &mut Json) -> Vec<Note> {
         ("school", &["referer_path"][..]),
         ("cookies", &["session", "captcha"][..]),
         ("password", &["des_keys"][..]),
-        // course 里只补"系统通用"的键；keyword / candidates / campus 是用户自己的数据
-        ("course", &["class_type", "is_major", "query_content"][..]),
     ] {
         if reference.object(sec).is_none() {
             continue;
@@ -692,6 +690,26 @@ pub fn fill_reference(raw: &mut Json) -> Vec<Note> {
             take_if_missing(raw, &reference, k, sec, &mut filled);
         }
     }
+    // 目标课程：只补"系统通用"的键；keyword / candidates 是用户自己的数据，绝不凭空造
+    config::normalize_courses(raw);
+    let ref_course = reference.array("courses").first().cloned().unwrap_or(Json::Null);
+    for k in ["class_type", "is_major", "query_content"] {
+        let has = raw
+            .array("courses")
+            .first()
+            .map(|c| c.get(k).is_some())
+            .unwrap_or(false);
+        if has {
+            continue;
+        }
+        if let Some(v) = ref_course.get(k).cloned() {
+            if let Some(slot) = raw.ensure_arr("courses").first_mut() {
+                slot.set_key(k, v);
+                filled.push(format!("course.{k}"));
+            }
+        }
+    }
+
     // paths 整段：少一个键程序就会在启动时报"配置不完整"
     if let Some(Json::Obj(pairs)) = reference.object("paths") {
         let keys: Vec<String> = pairs
@@ -1260,10 +1278,11 @@ fn widen_session_cookies(configured: &[String], observed: &[String]) -> Vec<Stri
     out
 }
 
-/// 把勾选的教学班写进 `course.candidates`（整段替换），返回写入条数。
+/// 把勾选的教学班写进第 `ci` 门课的 `candidates`（整段替换），返回写入条数。
 ///
-/// `keyword` 传空串表示"不动 course.keyword"；传了就写进去（抢课时的白名单标签用它）。
-pub fn write_candidates(raw: &mut Json, picked: &[&Found], keyword: &str) -> usize {
+/// `keyword` 传空串表示"不动那门课的 keyword"；传了就写进去（抢课时的白名单标签用它），
+/// 并在那门课还没有名字时顺手把名字也填上。
+pub fn write_candidates(raw: &mut Json, ci: usize, picked: &[&Found], keyword: &str) -> usize {
     let mut arr: Vec<Json> = Vec::with_capacity(picked.len());
     for f in picked {
         arr.push(Json::obj(vec![
@@ -1276,12 +1295,27 @@ pub fn write_candidates(raw: &mut Json, picked: &[&Found], keyword: &str) -> usi
         ]));
     }
     let n = arr.len();
-    raw.ensure_obj("course")
-        .set_key("candidates", Json::Arr(arr));
-    // 顺手把关键词记下来：下次"联网拉取"和抢课时的白名单都用它
+    // 老配置（只有 `course`）先归一成 `courses`，否则这里会写进一个没人读的键
+    crate::config::normalize_courses(raw);
+    let courses = raw.ensure_arr("courses");
+    if ci >= courses.len() {
+        return 0;
+    }
+    let course = &mut courses[ci];
+    course.set_key("candidates", Json::Arr(arr));
     if !keyword.trim().is_empty() {
-        raw.ensure_obj("course")
-            .set_key("keyword", Json::str(keyword.trim()));
+        course.set_key("keyword", Json::str(keyword.trim()));
+        if course.text("name").trim().is_empty() {
+            course.set_key("name", Json::str(keyword.trim()));
+        }
+    }
+    // 这门课挑的候选里出现了哪几类，就把 course.class_type 定成第一类 ——
+    // 目录查询要用它（一门口径不对就会"查不到这门课"）。每个候选自己还带着 type，
+    // 所以跨类型挑选时提交报文照样是对的。
+    if let Some(first) = picked.iter().find(|f| !f.tc_type.is_empty()) {
+        if course.text("class_type").trim().is_empty() {
+            course.set_key("class_type", Json::str(first.tc_type.clone()));
+        }
     }
     n
 }
@@ -1442,10 +1476,10 @@ mod tests {
             "{base}/student/{code}.do"
         );
         assert_eq!(raw.object("password").unwrap().array("des_keys").len(), 3);
-        assert_eq!(raw.object("course").unwrap().text("class_type"), "FAWKC");
+        assert_eq!(raw.array("courses")[0].text("class_type"), "FAWKC");
         // 用户的数据不会被凭空造出来
-        assert!(raw.object("course").unwrap().get("candidates").is_none());
-        assert!(raw.object("course").unwrap().get("keyword").is_none());
+        assert!(raw.array("courses")[0].get("candidates").is_none());
+        assert!(raw.array("courses")[0].get("keyword").is_none());
         // Referer 故意不填
         assert_eq!(raw.object("school").unwrap().text("referer_path"), "");
         assert!(notes
@@ -1478,8 +1512,11 @@ mod tests {
             "/mine/volunteer.do"
         );
         assert_eq!(raw.object("password").unwrap().array("des_keys").len(), 1);
-        assert_eq!(raw.object("course").unwrap().text("keyword"), "我自己的课");
-        assert_eq!(raw.object("course").unwrap().array("candidates").len(), 1);
+        // 用户那门课一个字都没动 —— 只是被搬进了 courses 数组（界面/写回只认它）
+        let course = raw.array("courses")[0].clone();
+        assert_eq!(course.text("keyword"), "我自己的课");
+        assert_eq!(course.array("candidates").len(), 1);
+        assert!(raw.get("course").is_none(), "旧键搬家后该清掉，免得两份并存");
         // 但缺的键还是补上了
         assert_eq!(
             raw.object("paths").unwrap().text("capacity"),
@@ -1518,14 +1555,19 @@ mod tests {
         assert_eq!(f.group, "星期一-3-5");
         assert_eq!(f.label(), "01班 张三 星期一-3-5");
 
+        // 老格式（只有 course）也要能写进去 —— 写回前会先归一成 courses
         let mut raw = json::parse(r#"{"course":{"keyword":"旧"}}"#).unwrap();
-        let n = write_candidates(&mut raw, &[&f], "高等数学");
+        let n = write_candidates(&mut raw, 0, &[&f], "高等数学");
         assert_eq!(n, 1);
-        let cands = raw.object("course").unwrap().array("candidates").to_vec();
+        assert!(raw.get("course").is_none(), "旧键该被清掉");
+        let course = raw.array("courses")[0].clone();
+        let cands = course.array("candidates").to_vec();
         assert_eq!(cands.len(), 1);
         assert_eq!(cands[0].text("id"), "000000000000000000000001");
         assert_eq!(cands[0].text("group"), "星期一-3-5");
-        assert_eq!(raw.object("course").unwrap().text("keyword"), "高等数学");
+        assert_eq!(course.text("keyword"), "高等数学");
+        assert_eq!(course.text("name"), "高等数学", "没名字就拿关键词当名字");
+        assert_eq!(course.text("class_type"), "FANKC", "类别空着就跟着候选填");
     }
 
     #[test]

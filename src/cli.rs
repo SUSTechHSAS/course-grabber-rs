@@ -36,7 +36,10 @@ pub struct Args {
     pub burst: f64,
     pub interval: f64,
     pub slow: f64,
-    pub switch_after: f64,
+    /// 常驻：不设窗口上限，一直轮转（Ctrl-C / 抢齐 / 没有能打的候选才停）
+    pub forever: bool,
+    /// 每秒最多读几个候选的容量（读取总量是常数，不随课程数变多而爆炸）
+    pub poll: f64,
     pub keyword: Option<String>,
     pub force: bool,
     pub offline: bool,
@@ -102,7 +105,8 @@ impl Default for Args {
             burst: 5.0,
             interval: 1.0,
             slow: 1.5,
-            switch_after: 60.0,
+            forever: false,
+            poll: 3.0,
             keyword: None,
             force: false,
             offline: false,
@@ -216,13 +220,19 @@ fn help() -> String {
                         传 2~3 不会有额外效果；想收窄用 --single
   --write-timeout S     单发写请求最多占用几秒，默认 4。放课瞬间服务器过载时，
                         挂住的请求只会拖死它自己，不会吃掉整个窗口
-  --window S            放课后持续尝试的秒数，默认 600。放课瞬间学校会重排数据，
-                        写请求被拒二十秒起步，窗口给短了等于自己放弃
-  --burst S             放课后高强度的秒数（组内按优先级整轮轮询），默认 5
-  --interval S          爆发期每轮周期（秒），默认 1.0。每轮最多连发 3 发
-  --slow S              爆发期之后每轮间隔秒数，默认 1.5
-  --switch-after S      第一组一直没名额时，多少秒后换到下一冲突组（0=不换），默认 60
-  --keyword 课程名      目标课程名（用于建白名单）；默认取 config.json 里的 course.keyword
+  --forever             常驻：不设窗口上限，一直轮转下去。
+                        放课之外的时段也常有人退课被放出来，挂着一整晚都是机会。
+                        抢齐所有目标课程 / Ctrl-C 才停
+  --poll N              每秒最多读几个候选的容量，默认 3。**读取总量是常数** ——
+                        候选再多也是这个速率（一个时间片只读一个），所以挂几天
+                        也不会把请求量堆起来。读到空位就立刻发写请求
+  --window S            不用 --forever 时，放课后持续尝试的秒数，默认 600。
+                        放课瞬间学校会重排数据，写请求被拒二十秒起步，给短了等于放弃
+  --burst S             放课瞬间还用不用「一轮连打 3 个候选」，默认 5 秒。
+                        之后一律回到 --poll 的节奏（一个时间片一个候选）
+  --interval S          起步与爆发期的周期（秒），默认 1.0
+  --slow S              （已废弃：现在由 --poll 决定节奏，保留只为老命令不报错）
+  --keyword 课程名      只抢名字匹配的课程（多课程时的过滤器）；默认抢配置里所有课程
 
 其它
   --offline             完全不联网，只打印将要发送的内容
@@ -358,9 +368,10 @@ pub fn parse<I: IntoIterator<Item = String>>(argv: I) -> Result<Parsed, String> 
                 let v = value_of(&items, &mut i, &inline, "--slow")?;
                 args.slow = parse_float("--slow", &v)?;
             }
-            "--switch-after" => {
-                let v = value_of(&items, &mut i, &inline, "--switch-after")?;
-                args.switch_after = parse_float("--switch-after", &v)?;
+            "--forever" => args.forever = true,
+            "--poll" => {
+                let v = value_of(&items, &mut i, &inline, "--poll")?;
+                args.poll = parse_float("--poll", &v)?.clamp(0.1, 50.0);
             }
             "--relogin-gap" => {
                 let v = value_of(&items, &mut i, &inline, "--relogin-gap")?;
@@ -433,7 +444,8 @@ mod tests {
         assert_eq!(a.burst, 5.0);
         assert_eq!(a.interval, 1.0);
         assert_eq!(a.slow, 1.5);
-        assert_eq!(a.switch_after, 60.0);
+        assert_eq!(a.poll, 3.0);
+        assert!(!a.forever);
         assert_eq!(a.stagger, 0.10);
         assert_eq!(a.write_timeout, 4.0);
         assert_eq!(a.relogin_max, 4);

@@ -62,6 +62,13 @@ impl Json {
     ///
     /// "类型不对也换掉"是故意的：配置文件被手写坏了（`"school": "x"`）时，
     /// 用户应该能在界面里把它改回来，而不是只能看着报错去翻文件。
+    /// 删掉一个键（不存在就当没这回事）。界面里迁移旧格式时要用。
+    pub fn remove_key(&mut self, key: &str) {
+        if let Json::Obj(pairs) = self {
+            pairs.retain(|(k, _)| k != key);
+        }
+    }
+
     pub fn ensure_obj(&mut self, key: &str) -> &mut Json {
         if !matches!(self, Json::Obj(_)) {
             *self = Json::Obj(Vec::new());

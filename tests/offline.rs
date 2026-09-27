@@ -24,7 +24,7 @@ use course_grabber::grab::{self, Group, School, State, Verdict};
 use course_grabber::json;
 use course_grabber::pacer::WritePacer;
 use course_grabber::timeutil;
-use mock::{LoginReply, Mock, Mode, AUTH_BACK_AFTER};
+use mock::{LoginReply, Mock, Mode, AUTH_BACK_AFTER, OUTAGE_ENDS};
 
 const TEST_CONFIG: &str = include_str!("config.test.json");
 const KEYS: [&str; 3] = ["this", "password", "is"];
@@ -414,7 +414,7 @@ fn read_path_recovers_but_write_never_replays() {
         Some(relogin_manager(&ep, 4, 2)),
     );
     school.set_code(STUDENT);
-    let res = school.submit(STUDENT, "B1", "TC1", "01", None, Some(2.0));
+    let res = school.submit(STUDENT, "B1", "TC1", "01", None, None, Some(2.0));
     let (verdict, _msg) = grab::classify(&res.payload, res.status, &res.text);
     assert_eq!(verdict, Verdict::Expired, "写请求被判过期");
     assert_eq!(
@@ -660,18 +660,13 @@ fn full_candidates_after_the_outage_still_roll_to_the_next_group() {
             "http://x/y.do?token=t",
             "--live",
             "--window",
-            "8.0",
+            "4.0",
             "--burst",
             "0.2",
             "--interval",
             "1.0",
-            "--slow",
-            "1.0",
-            // 必须**明显大于** --interval：换组条件里的 `now > switch_at` 是在每轮开头
-            // 判的，两者相等的话第一轮（t = fire_at + interval）就会立刻换组 ——
-            // 那样这条测试根本走不到"停机结束"那一步，也就测不出被 outage_since 挡住。
-            "--switch-after",
-            "2.0",
+            "--poll",
+            "5",
         ]
         .iter()
         .map(|s| s.to_string()),
@@ -713,6 +708,218 @@ fn full_candidates_after_the_outage_still_roll_to_the_next_group() {
     assert!(
         asked.iter().any(|id| id.ends_with("000002")),
         "第二冲突组一次都没被问到 —— 换组被 outage_since 挡住了：{asked:?}"
+    );
+    // 关键的那半条：**停机结束之后**还在轮转第二组。
+    // 2026-09-27 那晚的 bug 不是"从没问过第二组"，而是"停机一结束就再也不换组了"
+    // ——脚本在第一组上安静地轮询了 9 分钟。
+    let late: Vec<f64> = mock
+        .calls_to("capacity.do")
+        .iter()
+        .filter(|c| c.field("teachingClassId").ends_with("000002") && c.at >= OUTAGE_ENDS)
+        .map(|c| c.at)
+        .collect();
+    assert!(
+        !late.is_empty(),
+        "停机结束后就没再问过第二冲突组（那晚就是这样漏掉 318 的）：{asked:?}"
+    );
+    mock.close();
+}
+
+/// 造一个"带着课程号与冲突组"的候选（`retry_loop` 直接吃 Target）。
+fn tgt(tc: &str, label: &str, course_idx: usize, group: &str) -> grab::Target {
+    grab::Target {
+        tc: tc.to_string(),
+        label: label.to_string(),
+        tc_type: None,
+        course_idx,
+        group: group.to_string(),
+        is_major: None,
+    }
+}
+
+/// 抢到一门课之后**继续抢其余的**，而且绝不能双选。
+///
+/// 顺带把多课程之后"不双选"那两条不变量钉住 —— 它们现在是唯一的依据，
+/// 轮转调度本身不再承担这个职责（旧写法靠"换组就不回头"来防，代价是 09-27
+/// 那晚第二组整晚没被碰过）：
+///   ① 每门课最多中一个；
+///   ② 同一个冲突组（星期-节次）最多中一个 —— 跨课程的时间冲突落在同一个组里。
+#[test]
+fn winning_one_course_keeps_going_and_never_double_selects() {
+    let mock = Mock::start(Mode::AlwaysWin, vec![]);
+    let ep = endpoints(mock.port);
+    let school = School::new(
+        Arc::clone(&ep),
+        "tok",
+        "JSESSIONID=x",
+        "http://x/y.do?token=tok",
+        4.0,
+        None,
+    );
+    school.set_code(STUDENT);
+    school.set_pacer(Arc::new(WritePacer::new(3, 1.0, 0.15, 0.10)));
+
+    let args = match cli::parse(
+        [
+            "--url",
+            "http://x/y.do?token=t",
+            "--live",
+            "--window",
+            "8.0",
+            "--burst",
+            "0.0",
+            "--interval",
+            "0.5",
+            "--poll",
+            "6",
+        ]
+        .iter()
+        .map(|s| s.to_string()),
+    )
+    .unwrap()
+    {
+        cli::Parsed::Run(a) => *a,
+        _ => unreachable!(),
+    };
+
+    // 第一门课有两个班在**同一个时段**（同组互斥）；第二门课在另一个时段
+    let groups = vec![
+        Group {
+            name: "星期三-3-5".to_string(),
+            members: vec![
+                tgt("000000000000000000000001", "线代A班", 0, "星期三-3-5"),
+                tgt("000000000000000000000002", "线代B班", 0, "星期三-3-5"),
+            ],
+        },
+        Group {
+            name: "星期五-3-5".to_string(),
+            members: vec![tgt("000000000000000000000003", "大物A班", 1, "星期五-3-5")],
+        },
+    ];
+    let state = State::for_courses(2);
+    grab::retry_loop(
+        Arc::clone(&school),
+        STUDENT.to_string(),
+        "BATCH1".to_string(),
+        "01".to_string(),
+        groups,
+        Arc::clone(&state),
+        Arc::new(args),
+        timeutil::unix_now(),
+        0.35,
+        grab::Gate::new(),
+    );
+
+    let submitted = mock.submitted.lock().unwrap().clone();
+    assert!(
+        submitted.iter().any(|id| id.ends_with("000001")),
+        "第一门课该被提交：{submitted:?}"
+    );
+    assert!(
+        !submitted.iter().any(|id| id.ends_with("000002")),
+        "同一个时段的另一个班不该再提交（那就是双选）：{submitted:?}"
+    );
+    assert!(
+        submitted.iter().any(|id| id.ends_with("000003")),
+        "抢到一门之后该继续抢第二门课：{submitted:?}"
+    );
+    let got = state.acquired();
+    assert!(
+        got.iter().all(|a| a.is_some()),
+        "两门课都该确认到手（抢齐了才收工）：{got:?}"
+    );
+    assert!(state.is_done());
+    mock.close();
+}
+
+/// `--forever` + `--poll`：常驻要跑过窗口，而且**读取速率是常数**。
+///
+/// 常驻的代价全在读取量上（写请求只在真有空位时才发），所以"每秒最多读几个"
+/// 必须是硬约束：一个时间片只读一个候选，候选再多也只是轮得慢一些。
+#[test]
+fn forever_polls_past_the_window_and_honours_poll() {
+    let mock = Mock::start(Mode::AlwaysFull, vec![]);
+    let ep = endpoints(mock.port);
+    let school = School::new(
+        Arc::clone(&ep),
+        "tok",
+        "JSESSIONID=x",
+        "http://x/y.do?token=tok",
+        4.0,
+        None,
+    );
+    school.set_code(STUDENT);
+    school.set_pacer(Arc::new(WritePacer::new(3, 1.0, 0.15, 0.10)));
+
+    let args = match cli::parse(
+        [
+            "--url",
+            "http://x/y.do?token=t",
+            "--live",
+            "--forever",
+            "--window",
+            "2.0",
+            "--burst",
+            "0.0",
+            "--interval",
+            "1.0",
+            "--poll",
+            "2",
+        ]
+        .iter()
+        .map(|s| s.to_string()),
+    )
+    .unwrap()
+    {
+        cli::Parsed::Run(a) => *a,
+        _ => unreachable!(),
+    };
+
+    let groups = vec![Group {
+        name: "星期三-3-5".to_string(),
+        members: vec![tgt("000000000000000000000001", "A班", 0, "星期三-3-5")],
+    }];
+    let state = State::new();
+    let worker = {
+        let school = Arc::clone(&school);
+        let state = Arc::clone(&state);
+        std::thread::spawn(move || {
+            grab::retry_loop(
+                school,
+                STUDENT.to_string(),
+                "BATCH1".to_string(),
+                "01".to_string(),
+                groups,
+                state,
+                Arc::new(args),
+                timeutil::unix_now(),
+                0.35,
+                grab::Gate::new(),
+            )
+        })
+    };
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    let stopped_at = mock.t0.elapsed().as_secs_f64();
+    state.finish_quiet(); // 常驻没有自然的终点，测试里手动收工
+    worker.join().unwrap();
+
+    let caps = mock.calls_to("capacity.do");
+    assert!(caps.len() >= 3, "该在只读轮询：{} 次容量请求", caps.len());
+    let last = caps.last().unwrap().at;
+    assert!(
+        last >= 2.5,
+        "常驻模式该跑过 --window 2.0s（最后一次读容量在 {last:.2}s，收工于 {stopped_at:.2}s）"
+    );
+    assert_eq!(
+        mock.write_count(),
+        0,
+        "候选全满时一发写请求都不该发（写请求是稀缺资源）"
+    );
+    let span = last - caps.first().unwrap().at;
+    let rate = (caps.len() as f64 - 1.0) / span.max(0.001);
+    assert!(
+        rate <= 2.0 * 1.3,
+        "读取速率 {rate:.2}/s 超过 --poll 2（容差 ×1.3）"
     );
     mock.close();
 }
@@ -847,14 +1054,23 @@ fn onboarding_fetches_candidates_from_mock_school() {
     assert_eq!(mock.write_count(), 0, "开荒阶段绝不能有写请求");
 
     // 勾两个写回配置：整段替换，并记下关键词
-    let mut raw = json::parse(TEST_CONFIG).unwrap();
+    let raw = json::parse(TEST_CONFIG).unwrap();
+    // 多课程：写进第 0 门课（老配置进来时界面会先把 course 搬进 courses[0]）
+    let mut raw = {
+        let mut r = raw;
+        let old = r.get("course").cloned().unwrap_or(json::Json::Null);
+        r.set_key("courses", json::Json::Arr(vec![old]));
+        r.remove_key("course");
+        r
+    };
     let n = course_grabber::onboard::write_candidates(
         &mut raw,
+        0,
         &[&got.rows[0], &got.rows[2]],
         "测试课程",
     );
     assert_eq!(n, 2);
-    let cands = raw.object("course").unwrap().array("candidates").to_vec();
+    let cands = raw.array("courses")[0].array("candidates").to_vec();
     assert_eq!(cands.len(), 2);
     assert_eq!(cands[0].text("id"), "000000000000000000000101");
     assert_eq!(cands[0].text("label"), "01班 张老师 星期一-3-5");

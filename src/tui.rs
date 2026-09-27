@@ -75,7 +75,7 @@ fn level_style(l: Level) -> &'static str {
 // 可编辑位置：一条 JSON 路径
 // ---------------------------------------------------------------------------
 
-/// 界面只认这四种形状的路径 —— 正好覆盖 config.json 的全部结构。
+/// 界面只认这几种形状的路径 —— 正好覆盖 config.json 的全部结构。
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Path {
     /// 顶层标量：`timezone_offset_hours`
@@ -84,8 +84,12 @@ enum Path {
     Sec(String, String),
     /// `cookies.session[2]`（元素本身是字符串）
     Item(String, String, usize),
-    /// `course.candidates[1].group`
+    /// `course.candidates[1].group`（老格式，只有一门课时仍然用它）
     ItemKey(String, String, usize, String),
+    /// `courses[i].<key>` —— 多课程：第 i 门课的某个字段
+    Course(usize, &'static str),
+    /// `courses[i].candidates[j].<key>`
+    CourseCand(usize, usize, &'static str),
 }
 
 impl Path {
@@ -103,6 +107,13 @@ impl Path {
             Path::Sec(s, k) => root.object(s)?.get(k),
             Path::Item(s, l, i) => root.object(s)?.array(l).get(*i),
             Path::ItemKey(s, l, i, k) => root.object(s)?.array(l).get(*i)?.get(k),
+            Path::Course(i, k) => root.array("courses").get(*i)?.get(k),
+            Path::CourseCand(i, j, k) => root
+                .array("courses")
+                .get(*i)?
+                .array("candidates")
+                .get(*j)?
+                .get(k),
         }
     }
 
@@ -120,6 +131,18 @@ impl Path {
                     slot.set_key(k, val);
                 }
             }
+            Path::Course(i, k) => {
+                if let Some(slot) = root.ensure_arr("courses").get_mut(*i) {
+                    slot.set_key(k, val);
+                }
+            }
+            Path::CourseCand(i, j, k) => {
+                if let Some(slot) = root.ensure_arr("courses").get_mut(*i) {
+                    if let Some(c) = slot.ensure_arr("candidates").get_mut(*j) {
+                        c.set_key(k, val);
+                    }
+                }
+            }
         }
     }
 
@@ -131,8 +154,16 @@ impl Path {
         }
     }
 
+    /// 这一行属于哪门课的候选列表（多课程时用来做"删/加"）。
+    fn course_cand_pos(&self) -> Option<(usize, usize)> {
+        match self {
+            Path::CourseCand(i, j, _) => Some((*i, *j)),
+            _ => None,
+        }
+    }
+
     fn indent(&self) -> usize {
-        if self.list_pos().is_some() {
+        if self.list_pos().is_some() || self.course_cand_pos().is_some() {
             1
         } else {
             0
@@ -171,6 +202,14 @@ struct Field {
 enum RowAct {
     /// 往某个列表里追加一项
     Add { sec: String, list: String },
+    /// 切到下一门目标课程
+    NextCourse,
+    /// 加一门新的目标课程
+    AddCourse,
+    /// 删掉当前这门课（至少留一门）
+    DelCourse,
+    /// 往"第 i 门课"的候选列表里追加一项
+    AddCourseCand(usize),
     /// 进向导的"学校地址"这一步（粘网址 / 光域名都行）
     WizardUrl,
     /// 从第一步开始的配置向导
@@ -702,6 +741,8 @@ struct App {
     wiz: Option<Box<Wizard>>,
     sec: usize,
     cur: usize,
+    /// 目标课程那一节正在编辑第几门课（`courses[cur_course]`）
+    cur_course: usize,
     top: usize,
     mode: Mode,
     msg: (String, Level),
@@ -717,7 +758,7 @@ impl App {
         let candidates = config::config_candidates(explicit);
         let found = candidates.iter().find(|p| p.is_file()).cloned();
 
-        let (path, raw, fresh) = match (explicit, found) {
+        let (path, mut raw, fresh) = match (explicit, found) {
             (Some(_), Some(p)) => {
                 let text = read_text(&p)?;
                 let raw = parse_config(&text, &p)?;
@@ -747,6 +788,11 @@ impl App {
             }
         };
 
+        // 目标课程统一成 `courses` 数组（老配置只写单个 `course` 也照读）。
+        // **界面只认 `courses`** —— 不然老配置进来是一张空表单，保存时又把 `course`
+        // 原样写回去，用户以为改好了，而程序读的是 `courses`。
+        config::normalize_courses(&mut raw);
+
         let mut app = App {
             path,
             raw,
@@ -762,6 +808,7 @@ impl App {
             wiz: None,
             sec: 0,
             cur: 0,
+            cur_course: 0,
             top: 0,
             mode: Mode::Browse,
             msg: (String::new(), Level::Ok),
@@ -987,37 +1034,65 @@ impl App {
     }
 
     fn rows_course(&self) -> Vec<Row> {
-        let s = "course";
+        let n = self.raw.array("courses").len().max(1);
+        let ci = self.cur_course.min(n - 1);
+        let cur = self
+            .raw
+            .array("courses")
+            .get(ci)
+            .cloned()
+            .unwrap_or(Json::Null);
+        let name = cur.text("name");
+        let kw = cur.text("keyword");
+        let title = if !name.is_empty() {
+            name.clone()
+        } else if !kw.is_empty() {
+            kw.clone()
+        } else {
+            "（还没填名字）".to_string()
+        };
+
         let mut v = vec![
-            row_field(Target::Config, s, "keyword", "课程名 keyword", Ty::Text),
-            row_field(
+            row_note(&format!("目标课程 {}/{}：{title}", ci + 1, n), ""),
+            row_act(RowAct::NextCourse, "⇄ 编辑下一门（在几门课之间轮换）"),
+            row_act(RowAct::AddCourse, "＋ 再加一门目标课程"),
+            row_act(RowAct::DelCourse, "✕ 删掉当前这门课（至少留一门）"),
+            row_path(
                 Target::Config,
-                s,
-                "class_type",
+                Path::Course(ci, "name"),
+                "名字 name",
+                Ty::Text,
+            ),
+            row_path(
+                Target::Config,
+                Path::Course(ci, "keyword"),
+                "课程名 keyword",
+                Ty::Text,
+            ),
+            row_path(
+                Target::Config,
+                Path::Course(ci, "class_type"),
                 "课程类型 class_type",
                 Ty::Text,
             ),
-            row_field(Target::Config, s, "campus", "校区 campus", Ty::Text),
-            row_field(
+            row_path(
                 Target::Config,
-                s,
-                "is_major",
+                Path::Course(ci, "is_major"),
                 "是否专业课 is_major",
                 Ty::Text,
             ),
-            row_field(
+            row_path(
                 Target::Config,
-                s,
-                "query_content",
+                Path::Course(ci, "query_content"),
                 "查询模板 query_content",
                 Ty::Text,
             ),
         ];
-        let cands: Vec<Json> = self
-            .raw
-            .object(s)
-            .map(|c| c.array("candidates").to_vec())
-            .unwrap_or_default();
+
+        let cands: Vec<Json> = cur.array("candidates").to_vec();
+        if cands.is_empty() {
+            v.push(row_note("候选教学班", "（这一门还没挑 —— 按下面那行拉课程目录）"));
+        }
         let mut shown_group = String::new();
         for (i, item) in cands.iter().enumerate() {
             let group = item.text("group");
@@ -1027,28 +1102,22 @@ impl App {
                 v.push(row_note(&format!("冲突组 {group}"), ""));
             }
             for key in ["id", "label", "group"] {
-                v.push(row_item(
+                v.push(row_path(
                     Target::Config,
-                    s,
-                    "candidates",
-                    i,
-                    Some(key),
-                    format!("[{i}].{key}"),
+                    Path::CourseCand(ci, i, key),
+                    &format!("[{i}].{key}"),
                     Ty::Text,
                 ));
             }
         }
         v.push(row_act(
             RowAct::FetchCandidates,
-            "⇣ 拉课程目录（每一类都拉下来，自己挑）",
+            "⇣ 拉课程目录（挑完写进**当前这门课**）",
         ));
-        v.push(row_add(s, "candidates", "＋ 添加候选教学班（手工填 ID）"));
-        if cands.is_empty() {
-            v.push(row_note(
-                "提示",
-                "候选可以为空 —— 那时得用 --priority 在命令行指定教学班 ID",
-            ));
-        }
+        v.push(row_act(
+            RowAct::AddCourseCand(ci),
+            "＋ 添加候选教学班（手工填 ID）",
+        ));
         v
     }
 
@@ -1517,7 +1586,7 @@ impl App {
             2 => "各接口的路径模板；{base} 会被上面的 base_path 替换".to_string(),
             3 => "登录态与验证码环节下发的 Cookie 名".to_string(),
             4 => "前端提交密码前用的加密密钥（顺序敏感）".to_string(),
-            5 => "目标课程与候选教学班；group 是冲突组（星期-节次）".to_string(),
+            5 => "目标课程（可以多门）：加课 / 删课 / 切换，各自挑候选教学班".to_string(),
             6 => "点选验证码识别参数".to_string(),
             7 => "写接口限流参数".to_string(),
             8 => "HTTP 头与超时".to_string(),
@@ -1882,11 +1951,22 @@ impl App {
     fn wizard_note_lines(&self, wz: &Wizard, width: usize) -> Vec<(String, &'static str)> {
         if wz.step == WStep::Done {
             let (sk, pk) = (&self.cred_keys.0, &self.cred_keys.1);
-            let cands = self
-                .raw
-                .object("course")
-                .map(|c| c.array("candidates").to_vec())
-                .unwrap_or_default();
+            // 多课程：把所有课的候选合起来数，课程名也一起列出来
+            let courses: Vec<Json> = self.raw.array("courses").to_vec();
+            let mut cands: Vec<Json> = Vec::new();
+            let mut course_names: Vec<String> = Vec::new();
+            for c in &courses {
+                let kw = c.text("keyword");
+                let nm = c.text("name");
+                course_names.push(if !nm.is_empty() {
+                    nm
+                } else if !kw.is_empty() {
+                    kw
+                } else {
+                    "（未命名）".to_string()
+                });
+                cands.extend(c.array("candidates").iter().cloned());
+            }
             let n = cands.len();
             let groups: Vec<String> = {
                 let mut g: Vec<String> = Vec::new();
@@ -1899,6 +1979,11 @@ impl App {
                 g
             };
             let host = self.host_port();
+            let course_label = if course_names.is_empty() {
+                "（未命名）".to_string()
+            } else {
+                course_names.join("、")
+            };
             let mut out: Vec<(String, &'static str)> = Vec::new();
             let add = |t: String, style: &'static str, out: &mut Vec<(String, &'static str)>| {
                 for l in textw::wrap(&t, width, "        ") {
@@ -1908,8 +1993,7 @@ impl App {
             add("回车之后会写两个文件：".to_string(), S_BOLD, &mut out);
             add(
                 format!(
-                    "  · config.json —— 学校 {host}、课程「{}」、候选教学班 {} 个（冲突组 {}）",
-                    wz.keyword,
+                    "  · config.json —— 学校 {host}、课程「{course_label}」、候选教学班 {} 个（冲突组 {}）",
                     n,
                     if groups.is_empty() {
                         "没写".to_string()
@@ -2059,15 +2143,42 @@ impl App {
             v.push((Level::Err, "password.des_keys 里有空串".to_string()));
         }
 
-        let cands: Vec<Json> = self
-            .raw
-            .object("course")
-            .map(|c| c.array("candidates").to_vec())
-            .unwrap_or_default();
-        if cands.is_empty() {
+        // 多课程：逐门课校验候选。报问题时带上"第几门课 + 叫什么"，
+        // 否则两门课各有一个缺 id 的候选，用户根本分不清该去哪一门里改。
+        let courses: Vec<Json> = self.raw.array("courses").to_vec();
+        let mut all_courses_empty = true;
+        for (ci, course) in courses.iter().enumerate() {
+            let c = course.array("candidates");
+            if !c.is_empty() {
+                all_courses_empty = false;
+            }
+            let who = {
+                let n = course.text("name");
+                let k = course.text("keyword");
+                if !n.is_empty() {
+                    n
+                } else if !k.is_empty() {
+                    k
+                } else {
+                    format!("第 {} 门", ci + 1)
+                }
+            };
+            for (i, item) in c.iter().enumerate() {
+                if item.text("id").trim().is_empty() {
+                    v.push((Level::Err, format!("「{who}」候选 [{i}] 缺 id")));
+                }
+                if item.text("group").trim().is_empty() {
+                    v.push((
+                        Level::Warn,
+                        format!("「{who}」候选 [{i}] 没写 group（冲突组），跨组串行判断会不准"),
+                    ));
+                }
+            }
+        }
+        if all_courses_empty {
             v.push((
                 Level::Warn,
-                "没有候选教学班。按 6 到「目标课程」一节，光标移到「⇣ 拉课程目录」按 Enter ——\n              \u{4f1a}登录把每一类课都拉下来让你挑（只读）；不想联网也可以手工填 ID（或命令行 --priority）"
+                "所有目标课程都还没有候选教学班。按 6 到「目标课程」一节，光标移到「⇣ 拉课程目录」按 Enter ——\n              会登录把每一类课都拉下来让你挑（只读）；不想联网也可以手工填 ID（或命令行 --priority）"
                     .to_string(),
             ));
         }
@@ -2078,17 +2189,6 @@ impl App {
                  按 6 →「⇣ 拉课程目录」重挑一遍"
                     .to_string(),
             ));
-        }
-        for (i, c) in cands.iter().enumerate() {
-            if c.text("id").trim().is_empty() {
-                v.push((Level::Err, format!("候选 [{i}] 缺 id")));
-            }
-            if c.text("group").trim().is_empty() {
-                v.push((
-                    Level::Warn,
-                    format!("候选 [{i}] 没写 group（冲突组），跨组串行判断会不准"),
-                ));
-            }
         }
 
         let port = self
@@ -2590,6 +2690,15 @@ impl App {
                 }
             }
             Key::Char('a') => match self.target_list(&rows) {
+                Some((sec, list)) if list.is_empty() && sec.starts_with("courses[") => {
+                    let ci = sec
+                        .trim_start_matches("courses[")
+                        .split(']')
+                        .next()
+                        .and_then(|t| t.parse().ok())
+                        .unwrap_or(self.cur_course);
+                    self.add_course_cand(ci)
+                }
                 Some((sec, list)) => self.add_item(&sec, &list),
                 None => self.msg = ("这一节没有可添加的列表".into(), Level::Warn),
             },
@@ -2598,6 +2707,26 @@ impl App {
                     .get(self.cur)
                     .and_then(|r| r.field.as_ref())
                     .and_then(|f| f.path.list_pos());
+                let cand_pos = rows
+                    .get(self.cur)
+                    .and_then(|r| r.field.as_ref())
+                    .and_then(|f| f.path.course_cand_pos());
+                if let Some((ci, j)) = cand_pos {
+                    if let Some(c) = self.raw.ensure_arr("courses").get_mut(ci) {
+                        let a = c.ensure_arr("candidates");
+                        if j < a.len() {
+                            a.remove(j);
+                            self.dirty = true;
+                            self.msg = (
+                                format!("已删掉第 {} 门课的候选[{j}]（记得 s 保存）", ci + 1),
+                                Level::Warn,
+                            );
+                        }
+                    }
+                    let n = self.rows_with_values(self.sec).len();
+                    self.clamp(n, body_h);
+                    return;
+                }
                 match pos {
                     Some((sec, list, i)) => {
                         let a = self.raw.ensure_obj(&sec).ensure_arr(&list);
@@ -2643,6 +2772,10 @@ impl App {
         let from_row = |r: &Row| -> Option<(String, String)> {
             match &r.act {
                 Some(RowAct::Add { sec, list }) => Some((sec.clone(), list.clone())),
+                // 课程候选列表：走 add_course_cand，不用 {sec}.{list} 那套字符串路径
+                Some(RowAct::AddCourseCand(ci)) => {
+                    Some((format!("courses[{ci}].candidates"), String::new()))
+                }
                 _ => r
                     .field
                     .as_ref()
@@ -2659,6 +2792,39 @@ impl App {
         self.sec = self.sec.min(SEC_TITLES.len() - 1);
         self.cur = 0;
         self.top = 0;
+    }
+
+    /// 往第 `ci` 门课的候选列表里追加一项（并在界面上跳到它）。
+    ///
+    /// 和 `add_item` 同一套做法，只是路径多一层课程下标。
+    fn add_course_cand(&mut self, ci: usize) {
+        let entry = Json::obj(vec![
+            ("id", Json::Str(String::new())),
+            ("label", Json::Str(String::new())),
+            ("group", Json::Str(String::new())),
+        ]);
+        let idx = {
+            let courses = self.raw.ensure_arr("courses");
+            if ci >= courses.len() {
+                return;
+            }
+            let a = courses[ci].ensure_arr("candidates");
+            a.push(entry);
+            a.len() - 1
+        };
+        self.dirty = true;
+        let want = Path::CourseCand(ci, idx, "id");
+        let rows = self.rows_with_values(self.sec);
+        if let Some(pos) = rows
+            .iter()
+            .position(|r| r.field.as_ref().map(|f| f.path.clone()) == Some(want.clone()))
+        {
+            self.cur = pos;
+        }
+        self.msg = (
+            format!("已给第 {} 门课加了候选[{idx}]：填 id / label / group", ci + 1),
+            Level::Warn,
+        );
     }
 
     fn add_item(&mut self, sec: &str, list: &str) {
@@ -2716,6 +2882,48 @@ impl App {
     fn run_act(&mut self, act: RowAct) {
         match act {
             RowAct::Add { sec, list } => self.add_item(&sec, &list),
+            RowAct::AddCourseCand(ci) => self.add_course_cand(ci),
+            RowAct::NextCourse => {
+                let n = self.raw.array("courses").len().max(1);
+                self.cur_course = (self.cur_course + 1) % n;
+                self.msg = if n == 1 {
+                    ("只有一门目标课程；要加就按「＋ 再加一门」".into(), Level::Warn)
+                } else {
+                    (
+                        format!("正在编辑第 {}/{} 门课程", self.cur_course + 1, n),
+                        Level::Ok,
+                    )
+                };
+            }
+            RowAct::AddCourse => {
+                self.raw.ensure_arr("courses").push(Json::obj(vec![
+                    ("name", Json::str("")),
+                    ("keyword", Json::str("")),
+                    ("class_type", Json::str("")),
+                    ("is_major", Json::str("1")),
+                    ("query_content", Json::str("{keyword}")),
+                    ("candidates", Json::Arr(Vec::new())),
+                ]));
+                let n = self.raw.array("courses").len();
+                self.cur_course = n - 1;
+                self.dirty = true;
+                self.msg = (
+                    format!("已加第 {n} 门课程：填好名字/关键词，再「⇣ 拉课程目录」挑班"),
+                    Level::Warn,
+                );
+            }
+            RowAct::DelCourse => {
+                let n = self.raw.array("courses").len();
+                if n <= 1 {
+                    self.msg = ("至少要留一门目标课程".into(), Level::Warn);
+                } else {
+                    let i = self.cur_course.min(n - 1);
+                    self.raw.ensure_arr("courses").remove(i);
+                    self.cur_course = i.min(n - 2);
+                    self.dirty = true;
+                    self.msg = (format!("已删掉第 {} 门课程（记得 s 保存）", i + 1), Level::Warn);
+                }
+            }
             RowAct::Wizard => self.start_wizard(WStep::Url),
             RowAct::WizardUrl => self.start_wizard(WStep::Url),
             RowAct::Probe => {
@@ -3020,10 +3228,12 @@ impl App {
         } else {
             String::new()
         };
-        let n = onboard::write_candidates(&mut self.raw, &picked, &keyword);
+        // 写进"当前正在编辑的那门课"（多课程时这里曾经会写错门）
+        let ci = self.cur_course;
+        let n = onboard::write_candidates(&mut self.raw, ci, &picked, &keyword);
         self.dirty = true;
         let need_group = picked.iter().filter(|r| r.group.is_empty()).count();
-        let mut msg = format!("已写入 {n} 个候选教学班");
+        let mut msg = format!("已写入第 {} 门课的 {n} 个候选教学班", ci + 1);
         if need_group > 0 {
             msg.push_str(&format!(
                 "；其中 {need_group} 个推不出冲突组（上课地点里没写星期节次），抢课时会被当成各自独立的一组"
@@ -3354,7 +3564,9 @@ fn help_lines() -> &'static [&'static str] {
         "几条要知道的",
         "  · 只有「学校」这一节必须改：域名、base_path、page_path。粘一条网址就能填好。",
         "  · 接口路径（paths）不能空；粘网址时如果缺，会自动照参考实现补上。",
-        "  · 候选教学班的 group 是冲突组（星期-节次）：同组互斥最多中一个，跨组串行打。",
+        "  · 候选教学班的 group 是冲突组（星期-节次）：每个时段最多中一个，",
+        "    每门课也最多中一个（跨课程的时间冲突就落在同一个组名里）—— 所以不会双选。",
+        "  · 多门课：抢到一门之后其余继续轮转，全部抢齐才退出。",
         "  · password.des_keys 是学校前端加密密码用的密钥，顺序敏感，最多 3 组。",
         "  · 灰字的「（默认 …）」表示文件里没写这个键、程序现在用的就是这个值；",
         "    按 Enter 改成别的才会写进文件，清空则回到默认。",
@@ -3390,6 +3602,7 @@ mod tests {
             wiz: None,
             sec: 0,
             cur: 0,
+            cur_course: 0,
             top: 0,
             mode: Mode::Browse,
             msg: (String::new(), Level::Ok),
@@ -3743,27 +3956,36 @@ mod tests {
     fn adding_and_deleting_list_items() {
         let mut app = example_app();
         app.sec = 5; // 目标课程
-        app.add_item("course", "candidates");
+        // 多课程：候选挂在 courses[<当前课程>] 下
+        app.add_course_cand(0);
+        assert_eq!(app.raw.array("courses")[0].array("candidates").len(), 4);
         assert_eq!(
-            app.raw.object("course").unwrap().array("candidates").len(),
-            4
-        );
-        assert!(matches!(app.mode, Mode::Edit(_)), "新增后应当直接进编辑态");
-        assert_eq!(
-            Path::ItemKey("course".into(), "candidates".into(), 3, "id".into())
+            Path::CourseCand(0, 3, "id")
                 .get(&app.raw)
                 .map(|v| v.as_text()),
             Some(String::new())
         );
 
-        // 删掉一项
-        let before = app.raw.object("course").unwrap().array("candidates").len();
-        let a = app.raw.ensure_obj("course").ensure_arr("candidates");
+        // 删掉一项：走 'd' 那条路（课程候选的位置由 path 认出来）
+        let before = app.raw.array("courses")[0].array("candidates").len();
+        let a = app.raw.ensure_arr("courses")[0].ensure_arr("candidates");
         a.remove(0);
         assert_eq!(
-            app.raw.object("course").unwrap().array("candidates").len(),
+            app.raw.array("courses")[0].array("candidates").len(),
             before - 1
         );
+    }
+
+    /// 老配置（只有单个 `course`）进界面时会被搬成 `courses` 数组 ——
+    /// 否则表单是空的、保存时又把 `course` 写回去，用户以为改好了而程序读的却是 `courses`。
+    #[test]
+    fn legacy_course_is_migrated_to_courses() {
+        let mut raw = json_of(r#"{"course":{"keyword":"线代","candidates":[{"id":"A"}]}}"#);
+        config::normalize_courses(&mut raw);
+        assert!(raw.get("course").is_none(), "旧键该被清掉");
+        assert_eq!(raw.array("courses").len(), 1);
+        assert_eq!(raw.array("courses")[0].text("keyword"), "线代");
+        assert_eq!(raw.array("courses")[0].array("candidates").len(), 1);
     }
 
     #[test]

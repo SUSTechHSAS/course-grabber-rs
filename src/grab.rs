@@ -35,7 +35,7 @@ use crate::auth::{self, Credentials, LoginSession, ReloginManager};
 use crate::captcha::{Captcha, Solver};
 use crate::cli::Args;
 use crate::clock::{self, DateSample};
-use crate::config::{self, Candidate, Endpoints};
+use crate::config::{self, Candidate, CourseCfg, Endpoints};
 use crate::httpc::{self, Response};
 use crate::json::{self, Json};
 use crate::log::{self, info};
@@ -876,6 +876,7 @@ impl School {
         batch: &str,
         campus: &str,
         tc_type: Option<&str>,
+        is_major: Option<&str>,
     ) -> String {
         let add = Json::obj(vec![(
             "data",
@@ -884,7 +885,14 @@ impl School {
                 ("studentCode", Json::str(code)),
                 ("electiveBatchCode", Json::str(batch)),
                 ("teachingClassId", Json::str(tc_id)),
-                ("isMajor", Json::str(self.ep.is_major.clone())),
+                // 每门课可以各自是方案内/方案外，所以 isMajor 随候选走
+                (
+                    "isMajor",
+                    Json::str(match is_major.filter(|s| !s.is_empty()) {
+                        Some(m) => m.to_string(),
+                        None => self.ep.is_major.clone(),
+                    }),
+                ),
                 ("campus", Json::str(campus)),
                 (
                     "teachingClassType",
@@ -902,6 +910,7 @@ impl School {
     ///
     /// 发出去之前先过 WritePacer：超过"每滚动窗口 N 发"的硬上限时在这里等，
     /// 而不是让学校回一句"请求过快"把整个会话打死。
+    #[allow(clippy::too_many_arguments)] // 报文要的就是这些字段，包一层结构体反而更难对
     pub fn submit(
         &self,
         code: &str,
@@ -909,12 +918,13 @@ impl School {
         tc_id: &str,
         campus: &str,
         tc_type: Option<&str>,
+        is_major: Option<&str>,
         timeout: Option<f64>,
     ) -> WriteResult {
         if let Some(p) = self.pacer() {
             p.acquire();
         }
-        let body = self.submit_body(tc_id, code, batch, campus, tc_type);
+        let body = self.submit_body(tc_id, code, batch, campus, tc_type, is_major);
         let t0 = timeutil::mono_now();
         let outcome = self.json_post_write(&self.ep.path("volunteer"), &body, timeout);
         let ms = (timeutil::mono_now() - t0) * 1000.0;
@@ -939,6 +949,7 @@ impl School {
     /// 给"多班错开同时发"用：过载时一条挂住的连接只会拖死它自己，
     /// 不会让同轮其它候选跟着一起等（实测这是放课窗口最大的时间黑洞）。
     /// 连接用完就关 —— 放课窗口里省下的重连时间远不如"不被拖住"值钱。
+    #[allow(clippy::too_many_arguments)]
     pub fn submit_fresh(
         &self,
         code: &str,
@@ -946,13 +957,14 @@ impl School {
         tc_id: &str,
         campus: &str,
         tc_type: Option<&str>,
+        is_major: Option<&str>,
         timeout: Option<f64>,
     ) -> WriteResult {
         if let Some(p) = self.pacer() {
             p.acquire();
         }
         let t = timeout.unwrap_or(self.write_timeout);
-        let body = self.submit_body(tc_id, code, batch, campus, tc_type);
+        let body = self.submit_body(tc_id, code, batch, campus, tc_type, is_major);
         let headers = self.headers();
         let t0 = timeutil::mono_now();
         let outcome = (|| -> std::io::Result<Response> {
@@ -1015,8 +1027,9 @@ impl School {
         tc_id: &str,
         campus: &str,
         tc_type: Option<&str>,
+        is_major: Option<&str>,
     ) -> Vec<u8> {
-        let body = self.submit_body(tc_id, code, batch, campus, tc_type);
+        let body = self.submit_body(tc_id, code, batch, campus, tc_type, is_major);
         let s = self.session();
         let head = [
             format!("POST {} HTTP/1.1", self.ep.path("volunteer")),
@@ -1104,7 +1117,10 @@ pub struct State {
 
 struct StateInner {
     done: bool,
-    confirmed: Option<String>,
+    /// 每门课抢到的教学班（下标 = `Target.course_idx`）。全都有值 = 抢齐。
+    acquired: Vec<Option<String>>,
+    /// 已经中过的冲突组（星期-节次）。同一时段最多中一个，跨课程也一样。
+    groups_won: HashSet<String>,
     /// 并行首发同时选上了多个（异常，需人工退课）
     multi: Vec<String>,
     /// 该候选已明确失败，别再打
@@ -1112,11 +1128,18 @@ struct StateInner {
 }
 
 impl State {
+    /// 单课程（自检与老调用方用这个）。
     pub fn new() -> Arc<State> {
+        State::for_courses(1)
+    }
+
+    /// 多课程：`acquired` 要为每门课留一格，"抢齐了没有"要拿它比。
+    pub fn for_courses(courses: usize) -> Arc<State> {
         Arc::new(State {
             inner: Mutex::new(StateInner {
                 done: false,
-                confirmed: None,
+                acquired: vec![None; courses.max(1)],
+                groups_won: HashSet::new(),
                 multi: Vec::new(),
                 blocked: HashSet::new(),
             }),
@@ -1139,7 +1162,44 @@ impl State {
     pub fn finish(&self, tc: &str) {
         let mut inner = self.lock();
         inner.done = true;
-        inner.confirmed = Some(tc.to_string());
+        inner.acquired[0] = Some(tc.to_string());
+    }
+
+    /// 确认抢到了 `tc`。返回"所有课程是否都抢齐了"。
+    ///
+    /// 多课程时这里同时落两条**不变量**（它们是"不双选"的全部依据，轮转调度本身
+    /// 不再承担这个职责）：
+    /// * 每门课最多中一个 —— 同一门课中两个教学班也是双选；
+    /// * 每个冲突组（星期-节次）最多中一个 —— 跨课程的时间冲突就落在同一组里。
+    pub fn acquire(&self, course_idx: usize, tc: &str, group: &str) -> bool {
+        let mut inner = self.lock();
+        if course_idx < inner.acquired.len() {
+            inner.acquired[course_idx] = Some(tc.to_string());
+        }
+        if !group.is_empty() {
+            inner.groups_won.insert(group.to_string());
+        }
+        let all = inner.acquired.iter().all(|a| a.is_some());
+        inner.done = all || !inner.multi.is_empty();
+        all
+    }
+
+    /// 某门课已经抢到了哪个教学班。
+    pub fn acquired(&self) -> Vec<Option<String>> {
+        self.lock().acquired.clone()
+    }
+
+    pub fn course_won(&self, course_idx: usize) -> bool {
+        self.lock()
+            .acquired
+            .get(course_idx)
+            .map(|a| a.is_some())
+            .unwrap_or(false)
+    }
+
+    /// 这个冲突组是不是已经有候选被抢到了 —— 有的话整组都不该再碰。
+    pub fn group_won(&self, group: &str) -> bool {
+        !group.is_empty() && self.lock().groups_won.contains(group)
     }
 
     /// 只标记"结束"，不设 confirmed（对应原版 `state.done = True`）。
@@ -1152,7 +1212,7 @@ impl State {
     }
 
     pub fn confirmed(&self) -> Option<String> {
-        self.lock().confirmed.clone()
+        self.lock().acquired.iter().find_map(|a| a.clone())
     }
 
     pub fn multi(&self) -> Vec<String> {
@@ -1575,7 +1635,8 @@ fn process_ok(school: &School, code: &str, tries: usize) -> String {
 }
 
 /// 学校受理后：异步状态 + 已选课程列表双重复核。
-fn settle(school: &Arc<School>, code: &str, tc_id: &str, state: &Arc<State>) {
+fn settle(school: &Arc<School>, code: &str, t: &Target, state: &Arc<State>) {
+    let tc_id = &t.tc;
     info(&format!("  学校已受理 {tc_id}，开始严格复核…"));
     let st = process_ok(school, code, 6);
     info(&format!("  studentstatus: {st}"));
@@ -1583,7 +1644,18 @@ fn settle(school: &Arc<School>, code: &str, tc_id: &str, state: &Arc<State>) {
         match confirm(school, tc_id, 6, 0.4) {
             Ok(true) => {
                 info(&format!("✓✓✓ 已由学校已选课程列表确认选中: {tc_id}"));
-                state.finish(tc_id);
+                // 两条不变量一起落：这门课不再抢、这个时段（冲突组）整组封住
+                let all = state.acquire(t.course_idx, tc_id, &t.group);
+                let got = state.acquired();
+                let n = got.iter().filter(|a| a.is_some()).count();
+                if all {
+                    info(&format!("✓ 全部 {n} 门目标课程都抢到了"));
+                } else {
+                    info(&format!(
+                        "  已抢到 {n}/{} 门，继续轮转剩下的候选…",
+                        got.len()
+                    ));
+                }
                 return;
             }
             Ok(false) => {
@@ -1631,33 +1703,45 @@ fn audit_parallel(
             .map(|t| t.label.clone())
             .unwrap_or_default()
     };
-    let got: Vec<String> = candidates
+    let got: Vec<Target> = candidates
         .iter()
         .filter(|t| now_ids.contains(&t.tc) && !before.contains(&t.tc))
-        .map(|t| t.tc.clone())
+        .cloned()
         .collect();
-    if got.len() > 1 {
+    // 多课程时"中了两门不同的课"是**正常**的，不该报警。要报警的只有那两条不变量
+    // 被破：同一门课中了两个教学班，或者同一个时段（冲突组）中了两门 ——
+    // 并发的首发请求有可能同时通过学校的冲突检查再各自落库（TOCTOU 竞态）。
+    let mut dup: Vec<String> = Vec::new();
+    let mut seen_course: HashSet<usize> = HashSet::new();
+    let mut seen_group: HashSet<String> = HashSet::new();
+    for t in &got {
+        let same_course = !seen_course.insert(t.course_idx);
+        let same_group = !t.group.is_empty() && !seen_group.insert(t.group.clone());
+        if same_course || same_group {
+            dup.push(t.tc.clone());
+        }
+    }
+    for t in &got {
+        info(&format!(
+            "✓✓✓ 已由学校已选课程列表确认选中: {}  {}",
+            t.tc,
+            label(&t.tc)
+        ));
+        state.acquire(t.course_idx, &t.tc, &t.group);
+    }
+    if !dup.is_empty() {
         log::blank();
         log::rule('!');
-        log::log("  ⚠ 检测到并行首发同时选上了同一门课的多个教学班：");
-        for tc in &got {
+        log::log("  ⚠ 检测到同一门课 / 同一时段同时选上了多个教学班：");
+        for tc in &dup {
             log::log(&format!("      {tc}  {}", label(tc)));
         }
         log::log("  脚本不会替你退课。请自己打开学校页面，退掉你不要的那个。");
         log::log("  注意：退课后再选可能触发学校的「退选再选」限制，请一次想清楚。");
         log::rule('!');
-        state.set_multi(got.clone());
-        return got;
+        state.set_multi(dup.clone());
     }
-    if got.len() == 1 {
-        info(&format!(
-            "✓✓✓ 已由学校已选课程列表确认选中: {}  {}",
-            got[0],
-            label(&got[0])
-        ));
-        state.finish(&got[0]);
-    }
-    got
+    got.iter().map(|t| t.tc.clone()).collect()
 }
 
 // ==========================================================================
@@ -1674,6 +1758,16 @@ pub struct Target {
     pub tc: String,
     pub label: String,
     pub tc_type: Option<String>,
+    /// 这个候选属于第几门目标课程（0 起）。抢到之后"这门课就不再抢了"靠它分辨。
+    pub course_idx: usize,
+    /// 冲突组（星期-节次），**规范化之后**的组名 —— 和 `Group.name` 是同一个串。
+    ///
+    /// 存一份在候选上是为了"每个冲突组最多中一个"这条不变量：确认选中时要能立刻
+    /// 知道该把哪个组标记成已满足，而不必反查 groups 表。
+    pub group: String,
+    /// 提交报文里的 `isMajor`。`None` = 用所属课程的 `is_major`。
+    /// 多课程时两门课可能一个方案内一个方案外，所以要能各自带。
+    pub is_major: Option<String>,
 }
 
 impl Target {
@@ -1682,12 +1776,20 @@ impl Target {
             tc: tc.into(),
             label: label.into(),
             tc_type: None,
+            course_idx: 0,
+            group: String::new(),
+            is_major: None,
         }
     }
 
     /// 提交这份报文时用的类型；`None` = 交给 `Endpoints.class_type`。
     pub fn wire_type(&self) -> Option<&str> {
         self.tc_type.as_deref().filter(|s| !s.is_empty())
+    }
+
+    /// 提交这份报文时用的 `isMajor`；`None` = 交给 `Endpoints.is_major`。
+    pub fn wire_is_major(&self) -> Option<&str> {
+        self.is_major.as_deref().filter(|s| !s.is_empty())
     }
 }
 
@@ -1726,7 +1828,7 @@ pub fn fire_round(
             let tx = tx.clone();
             let t = t.clone();
             scope.spawn(move || {
-                let res = school.submit_fresh(code, batch, &t.tc, campus, t.wire_type(), timeout);
+                let res = school.submit_fresh(code, batch, &t.tc, campus, t.wire_type(), t.wire_is_major(), timeout);
                 let _ = tx.send((t.tc.clone(), res));
             });
             started += 1;
@@ -1757,18 +1859,40 @@ pub fn fire_round(
     collected
 }
 
-/// 首发之后的持续尝试。
+/// 算一遍"现在还能打的候选"，按 组 → 组内 的顺序。
 ///
-/// 按冲突组串行：先把第一组打穿（全被拒或中了一个），才轮到下一组。
-/// 绝不跨组并发/交替提交 —— 否则周三的班和周五的班可能同时选上，变成双选。
+/// 每一轮轮转开始时现算，于是三类候选会自动消失：刚被判死的、刚抢到的、
+/// 以及"这门课已经中了"或"这个时段（冲突组）已经中了"的。
+fn build_order(groups: &[Group], state: &State) -> Vec<(usize, usize)> {
+    let blocked = state.blocked_ids();
+    let mut out = Vec::new();
+    for (gi, g) in groups.iter().enumerate() {
+        if state.group_won(&g.name) {
+            continue; // 这个时段已经中了一个，整组都不能再碰
+        }
+        for (mi, t) in g.members.iter().enumerate() {
+            if blocked.contains(&t.tc) || state.course_won(t.course_idx) {
+                continue;
+            }
+            out.push((gi, mi));
+        }
+    }
+    out
+}
+
+/// 首发之后的持续尝试 —— **轮转调度器**。
 ///
-/// 组内每一轮按优先级顺序走一遍（而不是死磕第一优先级）：
-/// 低命中率的班放第一时，只打它会把放课后最关键的几秒全押空。
-/// 放课后前 `--burst` 秒用 `--interval` 的快节奏，之后放慢到 `--slow` 秒一轮。
+/// 每个时间片只读**一个**候选的容量：读到有空位就立刻出手，读到已满就什么都不做，
+/// 读不到（初始化中）就照打一发探针写。读取总量因此是常数（`--poll` 个/秒），
+/// 不会随课程数变多而爆炸；写请求则保持"低频"，只在真有空位（或读不到）时才发。
 ///
-/// 第一组若一直"满员"（不是被拒，只是没名额），它不会自己让位，
-/// 所以超过 `--switch-after` 秒仍无进展时强制换到下一组 —— 换过去就不再回头，
-/// 这也是安全的：一旦在下一组中了就停，不会又回到上一组造成双选。
+/// 组间**轮转**，不再是"换过去不回头"：一次走完所有还能打的候选，再从头来。
+/// 安全性不靠调度保证，靠 `State` 里那两条不变量 —— 每门课最多中一个、
+/// 每个冲突组（星期-节次）最多中一个；确认选中的那一刻就把组标记成已满足。
+/// （旧写法是单向往后换组 + `outage_since <= 0` 守着换组时机，2026-09-27 那晚
+/// 把第二组永久挡住了，整晚一次没碰 —— 见 README。）
+///
+/// `--forever` 时窗口是无穷：一直轮转，直到抢齐 / Ctrl-C / 没有能打的候选。
 #[allow(clippy::too_many_arguments)]
 pub fn retry_loop(
     school: Arc<School>,
@@ -1785,109 +1909,123 @@ pub fn retry_loop(
     // 首发已经用掉几发额度，重试循环要让开一个窗口。
     // 真正的硬保证在 WritePacer 里（首发与这里共用同一份额度）；
     // 这个 start 只是让日志与节奏好看，并且避免第一轮一开始就撞在节拍器上干等。
-    let start = fire_at + args.interval;
+    // 常驻：**立刻**开始轮转，不等放课时刻（可能提前几小时启动，等下去就是白等）
+    let start = if args.forever {
+        timeutil::unix_now()
+    } else {
+        fire_at + args.interval
+    };
     while timeutil::unix_now() < start && !state.is_done() && !state.stopped() {
         std::thread::sleep(Duration::from_secs_f64(
             (start - timeutil::unix_now()).clamp(0.0, 0.05),
         ));
     }
     let burst_until = fire_at + args.burst;
-    let mut switch_at = fire_at + args.switch_after;
-    let deadline = fire_at + args.window;
-    // 系统初始化期间谁提交都没用，这段停机不该算进"第一组多少秒没名额就换组"的计时
+    // `--forever`：不设上限，一直轮转下去
+    let deadline = if args.forever {
+        f64::INFINITY
+    } else {
+        fire_at + args.window
+    };
+    // 系统初始化期间谁提交都没用 —— 这段时间只做"探针写"，并记住它有多久
     let mut outage_since = 0.0f64;
     // "候选全满、只在只读轮询"时多久打一行心跳（秒）
     const IDLE_HEARTBEAT: f64 = 30.0;
     let mut last_idle_at = fire_at;
     let mut sent = 0usize;
-    let mut pace = args.interval; // 自适应节奏：被限流就退避，顺利就回到初始值
+    // 退避量：0 = 不额外等（正常节奏就是一个时间片 `poll_gap`）。
+    // 它是**加在** --poll 之上的，不能拿 --interval 当初值 —— 否则 --poll 再高
+    // 也会被 1 秒的地板压住（2026-09-27 写这条常驻测试时当场抓到）。
+    let mut pace = 0.0f64;
+    // 一个时间片的长度：每秒读 `--poll` 个候选
+    let poll_gap = 1.0 / args.poll.max(0.1);
+    // 学校连续回"不在选课开放时间范围内"几次就认为**轮次已经关了**。
+    // 常驻是好几天的事，轮次一关（比如选课期 2026-10-10 17:30 截止）再挂着就是纯空转。
+    // 取 3 次是为了躲开一次性的抖动。
+    const CLOSED_STREAK: usize = 3;
+    let mut closed_streak = 0usize;
 
-    for (gi, group) in groups.iter().enumerate() {
-        if state.is_done() || state.stopped() {
+    let mut order: Vec<(usize, usize)> = Vec::new();
+    let mut oi = 0usize;
+    loop {
+        if state.is_done() || state.stopped() || timeutil::unix_now() >= deadline {
             break;
         }
-        let blocked = state.blocked_ids();
-        if group.members.iter().all(|t| blocked.contains(&t.tc)) {
+        if order.is_empty() || oi >= order.len() {
+            order = build_order(&groups, &state);
+            oi = 0;
+            if order.is_empty() {
+                // 能打的都没了：要么全被判了终态，要么每门课都已经抢到
+                info("  没有还能提交的候选了（全被拒或已抢齐），收尾");
+                break;
+            }
+            let names: Vec<&str> = order.iter().map(|(g, _)| groups[*g].name.as_str()).collect();
+            info(&format!("  新一轮轮转: {names:?}"));
+        }
+        let (gi, mi) = order[oi];
+        oi += 1;
+        let group = &groups[gi];
+        let target = group.members[mi].clone();
+        // 这一轮排到他了，但**排完之后**可能刚中了一个（同一门课或同一个时段），
+        // 也可能刚被判死 —— 所以每一片都要重新确认，不能只信开头算的那份顺序。
+        // 漏了这一步就是双选：2026-09-27 加"抢到一门继续抢下一门"时，
+        // 正是这条测试当场抓出来的。
+        if state.group_won(&target.group)
+            || state.course_won(target.course_idx)
+            || state.blocked_ids().contains(&target.tc)
+        {
             continue;
         }
-        info(&format!(
-            "  进入冲突组 {}: {:?}",
-            group.name,
-            group
-                .members
-                .iter()
-                .map(|t| tail(&t.tc, 3))
-                .collect::<Vec<_>>()
-        ));
-        while timeutil::unix_now() < deadline && !state.is_done() && !state.stopped() {
-            let blocked = state.blocked_ids();
-            let pool: Vec<Target> = group
-                .members
-                .iter()
-                .filter(|t| !blocked.contains(&t.tc))
-                .cloned()
-                .collect();
-            if pool.is_empty() {
-                info(&format!("  冲突组 {} 全部被拒，换下一组", group.name));
-                break;
-            }
-            if gi < groups.len() - 1
-                && args.switch_after > 0.0
-                && timeutil::unix_now() > switch_at
-                && outage_since <= 0.0
-            {
-                info(&format!(
-                    "  冲突组 {} 过了 {:.0}s 仍没名额，轮到下一组",
-                    group.name, args.switch_after
-                ));
-                break;
-            }
-            let in_burst = timeutil::unix_now() < burst_until;
-            let base_gap = if in_burst {
-                args.interval
-            } else {
-                args.slow.max(args.interval)
-            };
+        {
+            // 爆发期只在放课时刻**附近**才算：常驻可能提前几小时启动，
+            // 不设下界的话整个下午都在"爆发"（不读容量、每片盲打 3 发）。
+            let now = timeutil::unix_now();
+            let in_burst = now >= fire_at - 0.5 && now < burst_until;
+            let base_gap = if in_burst { args.interval } else { poll_gap };
             let mut round_gap = base_gap.max(pace); // 被限流过就按退避后的节奏走
             let t_round = timeutil::unix_now();
 
-            // 先挑出本轮要打的候选。爆发期直接用提交当探针（抢的就是那几百毫秒）；
-            // 之后就先用只读的 capacity.do 探一下，没空位就不发写请求 ——
-            // 这样脚本可以整晚挂着捡漏，而不会把账号打成风控。
+            // 这一片要不要出手：
+            //   读到有空位 → 立刻打（"高频只读、低频写、读到就快写"）
+            //   读到已满   → 什么都不做，下一片看下一个候选
+            //   读不到     → 初始化中/容量接口不可信 ⇒ 照打一发探针，不因为读失败漏机会
             let mut picks: Vec<Target> = Vec::new();
             let mut capacity_alive = false;
-            for t in &pool {
-                if picks.len() >= 3 {
-                    break;
+            if in_burst {
+                // 放课瞬间（`--burst` 秒内）保持原样：不读容量，直接用提交当探针 ——
+                // 抢的就是那几百毫秒，连扫最多 3 个候选一起打。之后一律回到
+                // "一个时间片一个候选"。
+                let from = oi.saturating_sub(1);
+                let upto = (from + 3).min(order.len());
+                for (g2, m2) in &order[from..upto] {
+                    picks.push(groups[*g2].members[*m2].clone());
                 }
-                if !in_burst {
-                    // 0/0 之类的"读不到"⇒ None：照打，不因为读失败漏机会
-                    if let Some(free) = has_slot(&school, &t.tc, &batch) {
-                        // 容量接口回了真实数字（不管有没有空位）⇒ 系统已经读完数据了
+                oi = upto;
+            } else {
+                match has_slot(&school, &target.tc, &batch) {
+                    Some(true) => {
                         capacity_alive = true;
-                        if !free {
-                            continue; // 已满：不发写请求
-                        }
+                        picks.push(target.clone());
                     }
+                    Some(false) => capacity_alive = true,
+                    // 0/0 之类的"读不到"：照打，不因为读失败漏机会
+                    None => picks.push(target.clone()),
                 }
-                picks.push(t.clone());
             }
             if capacity_alive && outage_since > 0.0 {
                 // **第二冲突组整晚一发没试**的根因就在这儿（2026-09-27 实战）。
                 //
                 // 以前"停机结束"只认写请求的判决（Full / 正常回复），而系统恢复之后
                 // 候选全是满员 —— 脚本压根不发写请求，于是 outage_since 一直挂着；
-                // 换组的条件是 `outage_since <= 0`，本来就为了"停机期间别计时"，
-                // 结果变成**永远不换组**：那晚 306/307/308/309 那一组轮询了 9 分钟，
-                // 而 318 组（4 个非主选名额，是唯一名额多一倍的一组）从头到尾没被碰过，
-                // "进入冲突组 星期五-3-5" 打印出来的时刻正好是窗口截止那一刻。
+                // 那时候换组条件里有一句 `outage_since <= 0`，本身就是为"停机期间
+                // 别计时"设的，结果变成**永远不换组**：那晚 306/307/308/309 那一组
+                // 轮询了 9 分钟，而 318 组（4 个非主选名额，是唯一名额多一倍的一组）
+                // 从头到尾没被碰过，"进入冲突组 星期五-3-5" 打印出来的时刻正好是
+                // 窗口截止那一刻。
                 //
-                // 容量接口能读出真实数字，同样说明系统回来了，认它。
+                // 容量接口能读出真实数字（不管有没有空位），同样说明系统回来了，认它。
                 let back = timeutil::unix_now() - outage_since;
-                switch_at += back;
-                info(&format!(
-                    "  ✓ 服务恢复（容量接口已能读到真实数据，停机 {back:.0}s 已从换组倒计时里扣除）"
-                ));
+                info(&format!("  ✓ 服务恢复（容量接口已能读到真实数据，停机 {back:.0}s）"));
                 outage_since = 0.0;
             }
             if outage_since > 0.0 && !picks.is_empty() {
@@ -1898,15 +2036,15 @@ pub fn retry_loop(
                 round_gap = 0.6;
             }
             if picks.is_empty() {
-                // 候选全满 ⇒ 安静地只读轮询，等谁退课（设计如此：不把账号打成风控）。
+                // 满员 ⇒ 安静地只读轮询，等谁退课（设计如此：不把账号打成风控）。
                 // 但**不能真的安静** —— 2026-09-27 那晚这里静了 9 分钟（20:01:11 →
                 // 20:10:00），盯着屏幕只看到一片空白，分不清是"在等"还是"已经死了"。
                 let now = timeutil::unix_now();
                 if now - last_idle_at >= IDLE_HEARTBEAT {
                     info(&format!(
-                        "  候选仍全满（{} 组），继续只读轮询等空位… 已等 {:.0}s",
-                        group.name,
-                        now - fire_at
+                        "  候选全满，继续只读轮询等空位… 已等 {:.0}s（{} 个候选在轮转）",
+                        now - fire_at,
+                        order.len()
                     ));
                     last_idle_at = now;
                 }
@@ -1945,7 +2083,7 @@ pub fn retry_loop(
                     .map(|t| {
                         (
                             t.tc.clone(),
-                            school.submit(&code, &batch, &t.tc, &campus, t.wire_type(), Some(wt)),
+                            school.submit(&code, &batch, &t.tc, &campus, t.wire_type(), t.wire_is_major(), Some(wt)),
                         )
                     })
                     .collect()
@@ -1968,7 +2106,7 @@ pub fn retry_loop(
                         // 学校说"请求过快"就别硬顶，否则会被踢掉会话
                         // 退避上限压到 1.5s：被限流要收敛，但放课后这几秒
                         // 不能一路退到几秒一发，否则等于放弃窗口。
-                        pace = (pace * 2.0).min(1.5);
+                        pace = (pace.max(poll_gap) * 2.0).min(1.5);
                         if outage_since <= 0.0 {
                             outage_since = timeutil::unix_now();
                             info("  ⚠ 服务端进入初始化/限流状态（这段时间不计入换组倒计时）");
@@ -1988,14 +2126,31 @@ pub fn retry_loop(
                         ));
                     }
                     Verdict::Full | Verdict::WindowClosed | Verdict::Unknown => {
-                        pace = (pace * 0.7).max(args.interval);
+                        pace *= 0.7;
+                        if pace < poll_gap {
+                            pace = 0.0; // 退得够小了，回到正常节奏
+                        }
                         if outage_since > 0.0 {
                             let back = timeutil::unix_now() - outage_since;
-                            switch_at += back;
-                            info(&format!(
-                                "  ✓ 服务恢复（停机 {back:.0}s，已从换组倒计时里扣除）"
-                            ));
+                            info(&format!("  ✓ 服务恢复（写请求已经回正常业务判决，停机 {back:.0}s）"));
                             outage_since = 0.0;
+                        }
+                        if verdict == Verdict::WindowClosed {
+                            closed_streak += 1;
+                            if closed_streak >= CLOSED_STREAK && args.forever {
+                                log::blank();
+                                log::rule('!');
+                                log::log(
+                                    "  ✗ 学校连续回「不在选课开放时间范围内」—— 这一轮选课看起来已经结束了",
+                                );
+                                log::log("    收工（常驻不会为一个关掉的轮次空转）。下一个轮次原样重跑即可。");
+                                log::rule('!');
+                                state.finish_quiet();
+                                finished.open();
+                                return;
+                            }
+                        } else {
+                            closed_streak = 0;
                         }
                     }
                     Verdict::Submitted | Verdict::Duplicate => {
@@ -2005,7 +2160,7 @@ pub fn retry_loop(
                             got.ms,
                             short(&msg, 50)
                         ));
-                        settle(&school, &code, tc, &state);
+                        settle(&school, &code, t, &state);
                         if state.is_done() {
                             // 与 Python 一致：这里打完计数就收尾返回，不再走下面那段
                             // （否则日志里会出现两遍"本轮共提交 N 次"）
@@ -2031,7 +2186,7 @@ pub fn retry_loop(
                         ));
                         if !session_dead(&school, &code) {
                             info("  会话其实还活着（刚才那发是限流造成的假过期），继续");
-                            pace = (pace * 2.0).min(1.5);
+                            pace = (pace.max(poll_gap) * 2.0).min(1.5);
                             continue;
                         }
                         // 真死了：这里决定"救不救得回来"，而**绝不能**因此放弃窗口。
@@ -2082,7 +2237,7 @@ pub fn retry_loop(
                             }
                             if got {
                                 info("  ✓ 会话已登回来，立刻接着抢");
-                                pace = args.interval; // 新会话，节奏从头开始
+                                pace = 0.0; // 新会话，节奏从头开始
                                 continue;
                             }
                         }
@@ -2133,7 +2288,13 @@ pub fn retry_loop(
 // 主流程
 // ==========================================================================
 
-fn summarize(state: &State, candidates: &[Target], relogins: u32, pacer: &WritePacer) -> u8 {
+fn summarize(
+    state: &State,
+    candidates: &[Target],
+    courses: &[CourseCfg],
+    relogins: u32,
+    pacer: &WritePacer,
+) -> u8 {
     let label = |tc: &str| -> String {
         candidates
             .iter()
@@ -2160,7 +2321,7 @@ fn summarize(state: &State, candidates: &[Target], relogins: u32, pacer: &WriteP
     ));
     let multi = state.multi();
     if !multi.is_empty() {
-        log::log("  结果：⚠ 并行首发同时选上了多个教学班，需要你手动退掉多余的：");
+        log::log("  结果：⚠ 同一门课/同一时段同时选上了多个教学班，需要你手动退掉多余的：");
         for tc in &multi {
             log::log(&format!("      {tc}  {}", label(tc)));
         }
@@ -2168,17 +2329,51 @@ fn summarize(state: &State, candidates: &[Target], relogins: u32, pacer: &WriteP
         log::rule('=');
         return 4;
     }
-    if let Some(confirmed) = state.confirmed() {
-        log::log(&format!("  结果：抢到 {confirmed}  {}", label(&confirmed)));
-        log::log("  请立刻去学校页面核对；“已选课程”才是最终依据。");
+
+    // 逐门课报结果：多课程时"抢到两门中的一门"既不是失败也不是全功。
+    let acquired = state.acquired();
+    let got: Vec<&String> = acquired.iter().flatten().collect();
+    let missing: Vec<String> = courses
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| acquired.get(*i).map(|a| a.is_none()).unwrap_or(true))
+        .map(|(_, c)| format!("「{}」", c.display()))
+        .collect();
+    let total = courses.len().max(1);
+
+    if got.is_empty() {
+        log::log("  结果：本次运行未确认抢到任何目标教学班。");
+        log::log("  已选课程列表里没有出现目标教学班 —— 可能就是没抢上，不是脚本出错。");
+        log::log("  下一次放课可原样重跑；Cookie / 会话都会自动重新获取。");
         log::rule('=');
-        return 0;
+        return 1;
     }
-    log::log("  结果：本次窗口内未确认抢到。");
-    log::log("  已选课程列表里没有出现目标教学班 —— 可能就是没抢上，不是脚本出错。");
-    log::log("  下一次放课可原样重跑；Cookie / 会话都会自动重新获取。");
+
+    log::log(&format!(
+        "  结果：抢到 {}/{} 门，共 {} 个教学班",
+        total - missing.len(),
+        total,
+        got.len()
+    ));
+    for tc in &got {
+        log::log(&format!("      {tc}  {}", label(tc)));
+    }
+    if !missing.is_empty() {
+        log::log(&format!(
+            "  还没抢到：{}（会话/凭据都不用换，原样重跑就行）",
+            missing.join("、")
+        ));
+    } else {
+        log::log("  ✓ 所有目标课程都到手了。");
+    }
+    log::log("  请立刻去学校页面核对；“已选课程”才是最终依据。");
     log::rule('=');
-    1
+    if missing.is_empty() {
+        0
+    } else {
+        // 抢到一部分：既不算失败也不算完成，给个独立退出码
+        3
+    }
 }
 
 /// 只读演练：跑到 T-3s 就停，报告计时精度，不提交。
@@ -2209,9 +2404,11 @@ fn rehearsal(fire_at: f64) {
 ///
 /// 这一步很关键：等到 19:59:30 才发现会话死了，还有 30 秒可以自动重登录，
 /// 而不用等到放课瞬间才发现。
-fn refresh_before_fire(school: &Arc<School>, fire_at: f64, state: &Arc<State>) {
+fn refresh_before_fire(school: &Arc<School>, fire_at: f64, state: &Arc<State>, forever: bool) {
     let left = fire_at - timeutil::unix_now();
-    if left > 35.0 {
+    // 常驻可能提前几小时启动：绝对不能在这儿睡到 T-30s，那就等于整个下午什么都没干。
+    // 会话由轮转循环的只读请求自己续着（读路径会自愈），这里只探一次。
+    if left > 35.0 && !forever {
         if school.auth.is_some() {
             info(&format!(
                 "等待放课（{:.1} 分钟）… T-30s 会重新取会话并复验",
@@ -2320,6 +2517,27 @@ pub fn main(mut args: Args) -> Result<u8, String> {
         }
     }
 
+    // `--keyword` 在多课程配置里的语义：**只抢名字匹配的课程**（过滤器），
+    // 不再像单课程时代那样"覆盖那一门课的关键词"。
+    let courses_used: Vec<CourseCfg> = match &args.keyword {
+        Some(k) if !k.trim().is_empty() => {
+            let hits: Vec<CourseCfg> = ep
+                .courses
+                .iter()
+                .filter(|c| {
+                    c.display().contains(k.as_str()) || c.keyword.contains(k.as_str())
+                })
+                .cloned()
+                .collect();
+            if hits.is_empty() {
+                log::log(&format!("✗ --keyword {k} 没匹配到任何一门目标课程"));
+                return Ok(2);
+            }
+            hits
+        }
+        _ => ep.courses.clone(),
+    };
+
     log::rule('=');
     log::log("  教务系统抢课 · 放课窗口精准首发");
     log::rule('=');
@@ -2338,13 +2556,22 @@ pub fn main(mut args: Args) -> Result<u8, String> {
             tail(&token, 4)
         ));
     }
-    let keyword = args.keyword.clone().unwrap_or_else(|| ep.keyword.clone());
     log::log(&format!(
         "  目标课程   : {}",
-        if keyword.is_empty() {
-            "（未指定，靠 --priority 指定教学班）"
+        if courses_used.is_empty() {
+            "（未指定，靠 --priority 指定教学班）".to_string()
+        } else if courses_used.len() == 1 {
+            courses_used[0].display().to_string()
         } else {
-            &keyword
+            format!(
+                "{} 门 —— {}",
+                courses_used.len(),
+                courses_used
+                    .iter()
+                    .map(|c| c.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join("、")
+            )
         }
     ));
     log::log(&format!(
@@ -2722,56 +2949,85 @@ pub fn main(mut args: Args) -> Result<u8, String> {
     }
 
     info("预检 3/5：从课程目录解析候选教学班");
-    let catalog = if late {
-        Vec::new()
-    } else {
-        let tc_type = ep.class_type.clone();
-        match school.catalog_candidates(&code, &batch, &campus, &keyword, &tc_type) {
-            Ok(c) => c,
-            Err(e) => {
-                log::log(&format!(
-                    "⚠ 目录解析失败（不影响抢课，但白名单将只依赖 --priority）: {}",
+    // 多课程：**每门课各查一次**目录（目录接口一次只认一个关键词 + 一个类别）。
+    // 哪门课查到了就记下来 —— 白名单只对"查到过目录"的那几门课生效，
+    // 否则某门课目录恰好为空时会把它的候选全删掉。
+    let mut catalog: Vec<CatalogRow> = Vec::new();
+    let mut catalog_courses: HashSet<usize> = HashSet::new();
+    if !late {
+        for (ci, c) in courses_used.iter().enumerate() {
+            let kw = if c.keyword.is_empty() {
+                c.name.clone()
+            } else {
+                c.keyword.clone()
+            };
+            match school.catalog_candidates(&code, &batch, &campus, &kw, &c.class_type) {
+                Ok(rows) if !rows.is_empty() => {
+                    if courses_used.len() > 1 {
+                        log::log(&format!("      「{}」目录 {} 个教学班", c.display(), rows.len()));
+                    }
+                    catalog_courses.insert(ci);
+                    catalog.extend(rows);
+                }
+                Ok(_) => {
+                    if courses_used.len() > 1 {
+                        log::log(&format!("      「{}」目录未返回结果", c.display()));
+                    }
+                }
+                Err(e) => log::log(&format!(
+                    "⚠ 「{}」目录解析失败（不影响抢课，白名单将只依赖配置里的候选）: {}",
+                    c.display(),
                     e.message()
-                ));
-                Vec::new()
+                )),
             }
         }
-    };
+    }
     if !catalog.is_empty() {
-        for c in &catalog {
+        // 单课程时列全（与老版一致）；多课程时只报条数，免得刷屏
+        if courses_used.len() == 1 {
+            for c in &catalog {
+                log::log(&format!(
+                    "      {} 序{:>2} {:<6} {:<26} 满={} 冲突={}",
+                    c.tc_id,
+                    c.index,
+                    c.teacher,
+                    short(&c.place, 26),
+                    c.is_full,
+                    c.is_conflict
+                ));
+            }
             log::log(&format!(
-                "      {} 序{:>2} {:<6} {:<26} 满={} 冲突={}",
-                c.tc_id,
-                c.index,
-                c.teacher,
-                short(&c.place, 26),
-                c.is_full,
-                c.is_conflict
+                "      课程号 {}  学分 {}（MOOC 学分不占学分上限，非 MOOC 学分才计入 limitElective 上限）",
+                catalog[0].course_number, catalog[0].credit
             ));
         }
-        log::log(&format!(
-            "      课程号 {}  学分 {}（MOOC 学分不占学分上限，非 MOOC 学分才计入 limitElective 上限）",
-            catalog[0].course_number, catalog[0].credit
-        ));
     } else {
-        log::log("      （目录未返回结果，将只用 --priority 指定的教学班）");
+        log::log("      （目录未返回结果，将只用配置里的候选教学班）");
     }
 
-    // 白名单：优先用 --priority，否则用默认优先级；目录只用于校验与展示
+    // 白名单：优先用 --priority，否则用配置里的候选；目录只用于校验与展示
     // group_of: 教学班 -> 冲突组（星期-节次），用来决定哪些候选可以并发
-    let builtin_labels: Vec<Target> = ep
-        .candidates
+    //
+    // 多课程：候选来自 `courses_used`（= 配置里的 courses，`--keyword` 时是筛过的那几门），
+    // 每个候选带着 `course_idx`（属于哪门课）；`is_major` 随所属课程走 ——
+    // 两门课可能一个方案内一个方案外，而提交报文里的 isMajor 必须跟着对。
+    let builtin_labels: Vec<Target> = courses_used
         .iter()
-        .map(|c: &Candidate| Target {
-            tc: c.id.clone(),
-            label: c.label.clone(),
-            tc_type: c.tc_type.clone(),
+        .enumerate()
+        .flat_map(|(ci, k)| {
+            k.candidates.iter().map(move |c: &Candidate| Target {
+                tc: c.id.clone(),
+                label: c.label.clone(),
+                tc_type: c.tc_type.clone(),
+                course_idx: ci,
+                group: c.group.clone(),
+                is_major: Some(k.is_major.clone()),
+            })
         })
         .collect();
-    let mut group_of: Vec<(String, String)> = ep
-        .candidates
+    let mut group_of: Vec<(String, String)> = builtin_labels
         .iter()
-        .map(|c| (c.id.clone(), c.group.clone()))
+        .map(|t| (t.tc.clone(), t.group.clone()))
         .collect();
     for c in &catalog {
         let g = clock::time_group(&c.place);
@@ -2816,11 +3072,18 @@ pub fn main(mut args: Args) -> Result<u8, String> {
         }
         wanted
             .into_iter()
-            .map(|tc| Target {
-                label: lookup_label(&tc),
-                tc,
-                // --priority 手写的 ID：不知道类别，交给配置里那个
-                tc_type: None,
+            .map(|tc| match builtin_labels.iter().find(|t| t.tc == tc) {
+                // 配置里有这个候选：课程、类别、冲突组、isMajor 整个继承
+                Some(t) => t.clone(),
+                // 表外的完整 ID：不知道属于哪门课，按第一门课处理，类别交给配置
+                None => Target {
+                    label: lookup_label(&tc),
+                    tc,
+                    tc_type: None,
+                    course_idx: 0,
+                    group: String::new(),
+                    is_major: ep.courses.first().map(|k| k.is_major.clone()),
+                },
             })
             .collect()
     } else {
@@ -2829,16 +3092,19 @@ pub fn main(mut args: Args) -> Result<u8, String> {
 
     if !catalog.is_empty() {
         let allowed: HashSet<String> = catalog.iter().map(|c| c.tc_id.clone()).collect();
+        // 只校验"目录真的返回过结果"的那几门课 —— 某门课目录恰好为空时，
+        // 不能把它的候选当成"不在白名单里"删掉（那等于把整门课删了）
+        let in_scope = |t: &Target| catalog_courses.contains(&t.course_idx);
         let outside: Vec<String> = candidates
             .iter()
-            .filter(|t| !allowed.contains(&t.tc))
+            .filter(|t| in_scope(t) && !allowed.contains(&t.tc))
             .map(|t| t.tc.clone())
             .collect();
         if !outside.is_empty() {
             log::log(&format!(
                 "⚠ 以下教学班不在本次目录白名单里，已剔除: {outside:?}"
             ));
-            candidates.retain(|t| allowed.contains(&t.tc));
+            candidates.retain(|t| !in_scope(t) || allowed.contains(&t.tc));
         }
     }
     if candidates.is_empty() {
@@ -2846,20 +3112,28 @@ pub fn main(mut args: Args) -> Result<u8, String> {
         return Ok(2);
     }
 
-    // 按冲突组切分，保持优先级顺序。组内互相冲突（最多中一个），组间必须串行，
-    // 否则周三的班和周五的班可能同时选上 —— 这是脚本要极力避免的双选。
-    let mut groups: Vec<Group> = Vec::new();
-    for t in &candidates {
-        let g = group_of
+    // 冲突组规范化：组名必须和 `Group.name` 一致 —— 以目录里的上课地点为准，
+    // 目录没有就退回配置里写的，两边都没有就**各自成组**（最保守）。
+    // 候选自己存一份组名，是因为"每个冲突组最多中一个"这条不变量要在确认选中的
+    // 那一刻就能判定，不该反查 groups 表。
+    for t in &mut candidates {
+        t.group = group_of
             .iter()
             .find(|(id, _)| id == &t.tc)
             .map(|(_, g)| g.clone())
             .filter(|g| !g.is_empty())
-            .unwrap_or_else(|| t.tc.clone()); // 时段未知就各自成组（最保守）
-        match groups.iter_mut().find(|grp| grp.name == g) {
+            .unwrap_or_else(|| t.tc.clone());
+    }
+
+    // 按冲突组切分，保持优先级顺序。组内互相冲突（最多中一个），组间可以轮转 ——
+    // 跨课程的时间冲突天然落在同一个组名（`星期三-3-5`）里，所以两门课同一时段的
+    // 候选也会进同一组，不会同时中。
+    let mut groups: Vec<Group> = Vec::new();
+    for t in &candidates {
+        match groups.iter_mut().find(|grp| grp.name == t.group) {
             Some(grp) => grp.members.push(t.clone()),
             None => groups.push(Group {
-                name: g,
+                name: t.group.clone(),
                 members: vec![t.clone()],
             }),
         }
@@ -2877,13 +3151,23 @@ pub fn main(mut args: Args) -> Result<u8, String> {
         }
     }
 
-    // 硬保护 1：目标已在已选列表 -> 直接退出，绝不重复提交
-    for t in &candidates {
-        let tc = &t.tc;
-        if enrolled.contains(tc) {
-            log::log(&format!(
-                "\n✓ 教学班 {tc} 已在你的已选课程里 —— 无需抢课，脚本不做任何提交。"
-            ));
+    // 硬保护 1：已经在已选列表里的候选 -> 那一门课不再抢，绝不重复提交。
+    //
+    // 多课程时**不能整个退出**：手上已经有线性代数、还要抢大学物理是很正常的用法。
+    // （单课程的老行为在这里完全一致：那一门齐了就"没有还能提交的候选"，收工。）
+    let already: Vec<Target> = candidates
+        .iter()
+        .filter(|t| enrolled.contains(&t.tc))
+        .cloned()
+        .collect();
+    if !already.is_empty() {
+        candidates.retain(|t| !already.iter().any(|a| a.tc == t.tc));
+        let ids: Vec<&str> = already.iter().map(|t| t.tc.as_str()).collect();
+        log::log(&format!(
+            "\n✓ 这些教学班已经在你的已选课程里，不再抢它们：{ids:?}"
+        ));
+        if candidates.is_empty() {
+            log::log("  目标课程都齐了 —— 脚本不做任何提交。");
             return Ok(0);
         }
     }
@@ -3017,7 +3301,11 @@ pub fn main(mut args: Args) -> Result<u8, String> {
     }
 
     // ---------------- LIVE ----------------
-    let state = State::new();
+    let state = State::for_courses(courses_used.len());
+    // 预检时发现"已经在已选列表里"的课程：先记成已抢到，轮转会自动跳过它们
+    for t in &already {
+        state.acquire(t.course_idx, &t.tc, &t.group);
+    }
     // 写请求节拍器：实测滚动 1 秒最多 3 发，第 4 发会被限流并作废整个会话。
     // 首发的裸 socket 与重试循环共用同一个节拍器，否则两边各打各的就会凑出第 4 发
     // —— 2026-09-24 20:00 和 09-25 复现实验都是这么死的。
@@ -3037,12 +3325,20 @@ pub fn main(mut args: Args) -> Result<u8, String> {
     // "放弃并喊人" —— 但窗口只剩几十秒，喊人等于是放弃。
     // 真·凭据错误走的是另一条路（`BadCredentials` 直接熔断），不受这里影响。
     school.relax_relogin_limit(WINDOW_RELOGIN_BUDGET);
-    info(&format!(
-        "本次窗口：{} → {}（--window {:.0}s），之后自动收尾退出；中途 Ctrl-C 可随时手动停",
-        timeutil::civil(fire_at).hms(),
-        timeutil::civil(end_at).hms(),
-        args.window
-    ));
+    if args.forever {
+        info(&format!(
+            "常驻模式：{} 开打，之后一直轮转（抢齐 / Ctrl-C 才停）；每秒最多读 {} 个候选，读到空位才发写请求",
+            timeutil::civil(fire_at).hms(),
+            args.poll
+        ));
+    } else {
+        info(&format!(
+            "本次窗口：{} → {}（--window {:.0}s），之后自动收尾退出；中途 Ctrl-C 可随时手动停",
+            timeutil::civil(fire_at).hms(),
+            timeutil::civil(end_at).hms(),
+            args.window
+        ));
+    }
     info(&format!(
         "写请求节拍：滚动 {:.0}s 内最多 {} 发，相邻两发至少隔开 {:.0}ms（多等 {:.0}ms 安全边界）—— 首发与重试共用同一份额度",
         pacer.window,
@@ -3050,7 +3346,7 @@ pub fn main(mut args: Args) -> Result<u8, String> {
         pacer.min_gap * 1000.0,
         pacer.margin * 1000.0
     ));
-    refresh_before_fire(&school, fire_at, &state);
+    refresh_before_fire(&school, fire_at, &state, args.forever);
 
     info("预热 TCP 连接（握手提前完成，放课瞬间不再付 RTT）");
     // 首发只打第一冲突组。默认全部连接都打组内第一优先级；
@@ -3068,7 +3364,16 @@ pub fn main(mut args: Args) -> Result<u8, String> {
         width = width.max((conns as usize).min(3));
     }
     width = width.min(3).min(top_group.len()).max(1);
-    let volley: Vec<Target> = top_group.iter().take(width).cloned().collect();
+    //
+    // **常驻模式不发这一轮**：轮转循环已经在跑，读到空位就立刻出手（那才是"有空位才写"）；
+    // 而首发是"放课瞬间盲打"，实测放课那一瞬间学校正好在重排数据、会话当场作废
+    // （09-25/09-26/09-27 三晚都是），这 3 发大概率是废的，还要占写额度。
+    // 想保留"正点盲打"就别用 --forever。
+    let volley: Vec<Target> = if args.forever {
+        Vec::new()
+    } else {
+        top_group.iter().take(width).cloned().collect()
+    };
 
     // **错开**发，而不是同时发：实测（concurrent_probe，3/3 复现）
     //   3 发同一瞬间出去 → 只有 1 发拿到真正的业务回复，另外 2 发是 code=2 且 msg 为空的
@@ -3080,13 +3385,16 @@ pub fn main(mut args: Args) -> Result<u8, String> {
         .enumerate()
         .map(|(i, t)| {
             (
-                school.build_wire(&code, &batch, &t.tc, &campus, t.wire_type()),
+                school.build_wire(&code, &batch, &t.tc, &campus, t.wire_type(), t.wire_is_major()),
                 t.tc.clone(),
                 fire_at + i as f64 * args.stagger,
             )
         })
         .collect();
-    info(&format!(
+    if plans.is_empty() {
+        info("  常驻模式：不发盲打的首发，直接进轮转（读到空位才写）");
+    } else {
+        info(&format!(
         "  首发 {} 发（硬上限 3）→ {:?}{}",
         plans.len(),
         volley.iter().map(|t| tail(&t.tc, 3)).collect::<Vec<_>>(),
@@ -3096,6 +3404,7 @@ pub fn main(mut args: Args) -> Result<u8, String> {
             String::new()
         }
     ));
+    }
 
     // 多发首发串成"上一发响应回来再发下一发"（最多多等 overlap_wait）：
     // 既不会因为并发互斥白扔后两发，也不会被一个挂住的请求拖死。
@@ -3191,7 +3500,15 @@ pub fn main(mut args: Args) -> Result<u8, String> {
             short(&msg, 60)
         ));
         match verdict {
-            Verdict::Submitted | Verdict::Duplicate => settle(&school, &code, &shot.tc_id, &state),
+            Verdict::Submitted | Verdict::Duplicate => {
+                // 找回首发那一发对应的候选：抢到时要落"哪门课 / 哪个时段"两条不变量
+                let t = candidates
+                    .iter()
+                    .find(|c| c.tc == shot.tc_id)
+                    .cloned()
+                    .unwrap_or_else(|| Target::new(shot.tc_id.clone(), String::new()));
+                settle(&school, &code, &t, &state)
+            }
             Verdict::Conflict | Verdict::Terminal => state.block(&shot.tc_id),
             _ => {}
         }
@@ -3204,15 +3521,31 @@ pub fn main(mut args: Args) -> Result<u8, String> {
     }
 
     if !state.is_done() && !state.stopped() {
-        info("首发未定，交给重试循环…");
-        let stop_by = timeutil::unix_now() + args.window + 30.0;
+        if args.forever {
+            info("常驻中，交给轮转循环（抢齐 / Ctrl-C 才停）…");
+        } else {
+            info("首发未定，交给重试循环…");
+        }
+        // 常驻时**不能**按 --window 收工 —— 那会在十分钟后把常驻进程杀掉。
+        // 收口条件只有：轮转循环自己结束（抢齐 / 轮次关闭 / 没有能打的候选）或 Ctrl-C。
+        let stop_by = if args.forever {
+            f64::INFINITY
+        } else {
+            timeutil::unix_now() + args.window + 30.0
+        };
         while !retry_done.is_open() && timeutil::unix_now() < stop_by && !state.stopped() {
-            retry_done.wait(0.25);
+            retry_done.wait(if args.forever { 1.0 } else { 0.25 });
         }
     }
     drop(worker);
 
-    Ok(summarize(&state, &candidates, school.relogins(), &pacer))
+    Ok(summarize(
+        &state,
+        &candidates,
+        &courses_used,
+        school.relogins(),
+        &pacer,
+    ))
 }
 
 #[cfg(test)]
@@ -3336,7 +3669,7 @@ mod tests {
             4.0,
             None,
         );
-        let body = school.submit_body("TC1", "2026000000", "B1", "01", None);
+        let body = school.submit_body("TC1", "2026000000", "B1", "01", None, None);
         assert!(body.starts_with("addParam=%7B%22data%22%3A%7B%22operationType%22%3A%221%22"));
         let decoded = body.replace("addParam=", "");
         // 反向解一下，确认关键字段都在
@@ -3363,7 +3696,7 @@ mod tests {
             None,
         );
         let wire =
-            String::from_utf8_lossy(&school.build_wire("2026000000", "B1", "TC1", "01", None))
+            String::from_utf8_lossy(&school.build_wire("2026000000", "B1", "TC1", "01", None, None))
                 .into_owned();
         assert!(wire.starts_with("POST /api/elective/volunteer.do HTTP/1.1\r\n"));
         assert!(wire.contains("token: tok-abc\r\n"));
