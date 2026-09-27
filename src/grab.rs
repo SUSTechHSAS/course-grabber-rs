@@ -776,28 +776,6 @@ impl School {
     /// （方案内 / 方案外 / 校公选 / 体育 / 慕课）。配置里那个 `course.class_type`
     /// 是默认值；配置界面会在"你配的那类里查不到"时换别的类型再问一次，
     /// 好告诉用户"这门课其实属于方案内"。
-    pub fn catalog_candidates(
-        &self,
-        code: &str,
-        batch: &str,
-        campus: &str,
-        keyword: &str,
-        class_type: &str,
-    ) -> Result<Vec<CatalogRow>, SchoolError> {
-        // 预检按"这门课的配置"查（每门课的 query_content 可以不同）
-        Ok(self
-            .catalog_page(
-                code,
-                batch,
-                campus,
-                keyword,
-                class_type,
-                &self.ep.query_content,
-                0,
-            )?
-            .rows)
-    }
-
     /// 目录的一页。
     ///
     /// `page` 从 0 开始（前端就是这么传的）。分页要看的两个数是**课程条数**：
@@ -849,6 +827,8 @@ impl School {
             .get("totalCount")
             .and_then(|v| v.as_i64())
             .unwrap_or(-1);
+        let code = payload.text("code");
+        let msg = payload.text("msg");
         let courses = payload.array("dataList").len();
         let mut out = Vec::new();
         for course in payload.array("dataList") {
@@ -876,6 +856,8 @@ impl School {
             rows: out,
             courses,
             total,
+            code,
+            msg,
         })
     }
 
@@ -1090,6 +1072,10 @@ pub struct CatalogPage {
     pub courses: usize,
     /// 这类课一共几门；服务端没给就是 -1
     pub total: i64,
+    /// 服务端这次的 code / msg。**空结果必须能分辨**："这门课确实没开"
+    /// 和"查询被拒/参数不对"在日志里长得一模一样，光看"目录未返回结果"没法查。
+    pub code: String,
+    pub msg: String,
 }
 
 pub struct CatalogRow {
@@ -2005,7 +1991,11 @@ pub fn retry_loop(
             // 爆发期只在放课时刻**附近**才算：常驻可能提前几小时启动，
             // 不设下界的话整个下午都在"爆发"（不读容量、每片盲打 3 发）。
             let now = timeutil::unix_now();
-            let in_burst = now >= fire_at - 0.5 && now < burst_until;
+            // 常驻**永远不算爆发**：爆发期是"放课瞬间不读容量、每片盲打 3 发"，
+            // 跟首发那 3 发是同一件事的另一半。2026-09-27 实测：`--forever` 在过点后
+            // 启动时 fire_at = 现在，于是开头 5 秒算爆发 —— 半秒内白扔 3 发写请求
+            // （每一发都只会被回「超过课容量」），跟"低频写"是矛盾的。
+            let in_burst = !args.forever && now >= fire_at - 0.5 && now < burst_until;
             let base_gap = if in_burst { args.interval } else { poll_gap };
             let mut round_gap = base_gap.max(pace); // 被限流过就按退避后的节奏走
             let t_round = timeutil::unix_now();
@@ -3001,19 +2991,30 @@ pub fn main(mut args: Args) -> Result<u8, String> {
             } else {
                 c.keyword.clone()
             };
-            match school.catalog_candidates(&code, &batch, &campus, &kw, &c.class_type) {
-                Ok(rows) if !rows.is_empty() => {
+            // 用**这门课自己**的 query_content（各门课可以不同；慕课那条要带 MOOC:2 开关）
+            match school.catalog_page(
+                &code,
+                &batch,
+                &campus,
+                &kw,
+                &c.class_type,
+                &c.query_content,
+                0,
+            ) {
+                Ok(page) if !page.rows.is_empty() => {
                     if courses_used.len() > 1 {
-                        log::log(&format!("      「{}」目录 {} 个教学班", c.display(), rows.len()));
+                        log::log(&format!("      「{}」目录 {} 个教学班", c.display(), page.rows.len()));
                     }
                     catalog_courses.insert(ci);
-                    catalog.extend(rows);
+                    catalog.extend(page.rows);
                 }
-                Ok(_) => {
-                    if courses_used.len() > 1 {
-                        log::log(&format!("      「{}」目录未返回结果", c.display()));
-                    }
-                }
+                Ok(page) => log::log(&format!(
+                    "      「{}」目录 0 条（服务端 code={} msg={} totalCount={}）—— 见 README「目录查不到」",
+                    c.display(),
+                    if page.code.is_empty() { "-" } else { &page.code },
+                    short(&page.msg, 40),
+                    page.total
+                )),
                 Err(e) => log::log(&format!(
                     "⚠ 「{}」目录解析失败（不影响抢课，白名单将只依赖配置里的候选）: {}",
                     c.display(),
@@ -3041,8 +3042,10 @@ pub fn main(mut args: Args) -> Result<u8, String> {
                 catalog[0].course_number, catalog[0].credit
             ));
         }
+    } else if late {
+        log::log("      （已过点：本次跳过目录解析，冲突组与候选以配置为准）");
     } else {
-        log::log("      （目录未返回结果，将只用配置里的候选教学班）");
+        log::log("      （目录没给出可用的候选，将只用配置里的候选教学班）");
     }
 
     // 白名单：优先用 --priority，否则用配置里的候选；目录只用于校验与展示

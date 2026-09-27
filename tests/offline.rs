@@ -859,8 +859,11 @@ fn forever_polls_past_the_window_and_honours_poll() {
             "--forever",
             "--window",
             "2.0",
+            // 故意用默认的爆发期长度：常驻**永远不算爆发**（那是"放课瞬间盲打 3 发"，
+            // 跟首发是同一件事）。用 0 的话这条测试就白测了 —— 也不会发现
+            // "过点后启动 → 开头 5 秒算爆发 → 半秒白扔 3 发写请求"那个 bug。
             "--burst",
-            "0.0",
+            "5.0",
             "--interval",
             "1.0",
             "--poll",
@@ -913,7 +916,7 @@ fn forever_polls_past_the_window_and_honours_poll() {
     assert_eq!(
         mock.write_count(),
         0,
-        "候选全满时一发写请求都不该发（写请求是稀缺资源）"
+        "候选全满时一发写请求都不该发，常驻也不发爆发期那几发盲打（写请求是稀缺资源）"
     );
     let span = last - caps.first().unwrap().at;
     let rate = (caps.len() as f64 - 1.0) / span.max(0.001);
