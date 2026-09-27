@@ -1796,6 +1796,9 @@ pub fn retry_loop(
     let deadline = fire_at + args.window;
     // 系统初始化期间谁提交都没用，这段停机不该算进"第一组多少秒没名额就换组"的计时
     let mut outage_since = 0.0f64;
+    // "候选全满、只在只读轮询"时多久打一行心跳（秒）
+    const IDLE_HEARTBEAT: f64 = 30.0;
+    let mut last_idle_at = fire_at;
     let mut sent = 0usize;
     let mut pace = args.interval; // 自适应节奏：被限流就退避，顺利就回到初始值
 
@@ -1852,14 +1855,40 @@ pub fn retry_loop(
             // 之后就先用只读的 capacity.do 探一下，没空位就不发写请求 ——
             // 这样脚本可以整晚挂着捡漏，而不会把账号打成风控。
             let mut picks: Vec<Target> = Vec::new();
+            let mut capacity_alive = false;
             for t in &pool {
                 if picks.len() >= 3 {
                     break;
                 }
-                if !in_burst && has_slot(&school, &t.tc, &batch) == Some(false) {
-                    continue;
+                if !in_burst {
+                    // 0/0 之类的"读不到"⇒ None：照打，不因为读失败漏机会
+                    if let Some(free) = has_slot(&school, &t.tc, &batch) {
+                        // 容量接口回了真实数字（不管有没有空位）⇒ 系统已经读完数据了
+                        capacity_alive = true;
+                        if !free {
+                            continue; // 已满：不发写请求
+                        }
+                    }
                 }
                 picks.push(t.clone());
+            }
+            if capacity_alive && outage_since > 0.0 {
+                // **第二冲突组整晚一发没试**的根因就在这儿（2026-09-27 实战）。
+                //
+                // 以前"停机结束"只认写请求的判决（Full / 正常回复），而系统恢复之后
+                // 候选全是满员 —— 脚本压根不发写请求，于是 outage_since 一直挂着；
+                // 换组的条件是 `outage_since <= 0`，本来就为了"停机期间别计时"，
+                // 结果变成**永远不换组**：那晚 306/307/308/309 那一组轮询了 9 分钟，
+                // 而 318 组（4 个非主选名额，是唯一名额多一倍的一组）从头到尾没被碰过，
+                // "进入冲突组 星期五-3-5" 打印出来的时刻正好是窗口截止那一刻。
+                //
+                // 容量接口能读出真实数字，同样说明系统回来了，认它。
+                let back = timeutil::unix_now() - outage_since;
+                switch_at += back;
+                info(&format!(
+                    "  ✓ 服务恢复（容量接口已能读到真实数据，停机 {back:.0}s 已从换组倒计时里扣除）"
+                ));
+                outage_since = 0.0;
             }
             if outage_since > 0.0 && !picks.is_empty() {
                 // 服务端在初始化：多打没意义（每发都会被拒），但必须保持试探而且要快 ——
@@ -1869,10 +1898,24 @@ pub fn retry_loop(
                 round_gap = 0.6;
             }
             if picks.is_empty() {
-                let gap = round_gap - (timeutil::unix_now() - t_round);
+                // 候选全满 ⇒ 安静地只读轮询，等谁退课（设计如此：不把账号打成风控）。
+                // 但**不能真的安静** —— 2026-09-27 那晚这里静了 9 分钟（20:01:11 →
+                // 20:10:00），盯着屏幕只看到一片空白，分不清是"在等"还是"已经死了"。
+                let now = timeutil::unix_now();
+                if now - last_idle_at >= IDLE_HEARTBEAT {
+                    info(&format!(
+                        "  候选仍全满（{} 组），继续只读轮询等空位… 已等 {:.0}s",
+                        group.name,
+                        now - fire_at
+                    ));
+                    last_idle_at = now;
+                }
+                let gap = round_gap - (now - t_round);
                 interruptible_sleep(gap, Some(&state), 0.2);
                 continue;
             }
+            // 真要发写了，心跳重新计时（下次安静下来时再打一行）
+            last_idle_at = timeutil::unix_now();
 
             // 爆发期的写超时压到 2 秒：服务器过载时挂住的请求必须尽快放弃，
             // 否则"等超时"本身就吃掉了窗口。正常的写请求 RTT 是 60~200ms，

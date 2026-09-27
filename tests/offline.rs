@@ -630,6 +630,93 @@ fn auth_outage_at_the_window_does_not_abandon_the_run() {
     mock.close();
 }
 
+/// 2026-09-27 20:00 的真实事故：学校初始化结束之后所有候选都满员，脚本于是**安静地
+/// 只读轮询**（设计如此，不发写请求）。但"停机结束"这个状态以前只认写请求的判决
+/// （FULL / 正常回复），而那时候压根没有写请求 —— 于是 `outage_since` 一直挂着，
+/// 换组条件里那句 `outage_since <= 0` 就把换组永久挡住了：
+/// 那晚 306/307/308/309 那一组轮询了 9 分钟，而 **318 组从头到尾一发没试**
+/// （"进入冲突组 星期五-3-5" 打印出来的时刻正好是窗口截止那一刻）。
+/// 318 组有 4 个非主选名额，是唯一名额多一倍的一组。
+///
+/// 断言：第二个冲突组的教学班**被问过容量**。
+#[test]
+fn full_candidates_after_the_outage_still_roll_to_the_next_group() {
+    let mock = Mock::start(Mode::OutageThenFull, vec![]);
+    let ep = endpoints(mock.port);
+    let school = School::new(
+        Arc::clone(&ep),
+        "tok",
+        "JSESSIONID=x",
+        "http://x/y.do?token=tok",
+        4.0,
+        None,
+    );
+    school.set_code(STUDENT);
+    school.set_pacer(Arc::new(WritePacer::new(3, 1.0, 0.15, 0.10)));
+
+    let args = match cli::parse(
+        [
+            "--url",
+            "http://x/y.do?token=t",
+            "--live",
+            "--window",
+            "8.0",
+            "--burst",
+            "0.2",
+            "--interval",
+            "1.0",
+            "--slow",
+            "1.0",
+            // 必须**明显大于** --interval：换组条件里的 `now > switch_at` 是在每轮开头
+            // 判的，两者相等的话第一轮（t = fire_at + interval）就会立刻换组 ——
+            // 那样这条测试根本走不到"停机结束"那一步，也就测不出被 outage_since 挡住。
+            "--switch-after",
+            "2.0",
+        ]
+        .iter()
+        .map(|s| s.to_string()),
+    )
+    .unwrap()
+    {
+        cli::Parsed::Run(a) => *a,
+        _ => unreachable!(),
+    };
+
+    let groups = vec![
+        Group {
+            name: "星期三-3-5".to_string(),
+            members: vec![grab::Target::new("000000000000000000000001", "A班")],
+        },
+        Group {
+            name: "星期五-3-5".to_string(),
+            members: vec![grab::Target::new("000000000000000000000002", "B班")],
+        },
+    ];
+    grab::retry_loop(
+        Arc::clone(&school),
+        STUDENT.to_string(),
+        "BATCH1".to_string(),
+        "01".to_string(),
+        groups,
+        State::new(),
+        Arc::new(args),
+        timeutil::unix_now(),
+        0.35,
+        grab::Gate::new(),
+    );
+
+    let asked: Vec<String> = mock
+        .calls_to("capacity.do")
+        .iter()
+        .map(|c| c.field("teachingClassId"))
+        .collect();
+    assert!(
+        asked.iter().any(|id| id.ends_with("000002")),
+        "第二冲突组一次都没被问到 —— 换组被 outage_since 挡住了：{asked:?}"
+    );
+    mock.close();
+}
+
 // ==========================================================================
 // [N] 开荒：让普通用户"粘一条网址 + 学号密码"就能把配置填出来
 // ==========================================================================

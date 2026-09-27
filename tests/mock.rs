@@ -67,7 +67,14 @@ pub enum Mode {
     /// 认证接口同时返回 `#E2140600091 认证失败`，`AUTH_BACK_AFTER` 秒后才恢复。
     /// 2026-09-25 和 09-26 两次 20:00 实战都是这个状态。
     KickThenAuthBack,
+    /// 初始化**结束之后**容量接口开始回真实数字，但一个空位都没有。
+    /// 2026-09-27 的实战：脚本于是安静地只读轮询，"停机结束"这个状态再也没被认出来 ——
+    /// 见 `grab.rs` 里那段"第二冲突组整晚一发没试"的注释。
+    OutageThenFull,
 }
+
+/// `Mode::OutageThenFull` 的停机时长（秒）。
+pub const OUTAGE_ENDS: f64 = 2.0;
 
 /// `Mode::KickThenAuthBack` 的停机时长（秒）：这段时间内认证服务不可用。
 ///
@@ -317,7 +324,9 @@ fn serve(
         } else if method == "POST" && path_only.ends_with("volunteer.do") {
             // 写请求在任何模式下都要记账（自检要能断言"发了几发"）
             writes.lock().unwrap().push(t0.elapsed().as_secs_f64());
-            if mode == Mode::InitOutage {
+            let in_outage = mode == Mode::InitOutage
+                || (mode == Mode::OutageThenFull && t0.elapsed().as_secs_f64() < OUTAGE_ENDS);
+            if in_outage {
                 // 真实措辞：放课瞬间学校就是这个状态，而且**它被算作可重试**
                 json(r#"{"code":"0","msg":"选课系统正在初始化,请稍候..."}"#)
             } else {
@@ -326,6 +335,15 @@ fn serve(
         } else if mode == Mode::InitOutage && path_only.ends_with("capacity.do") {
             // 初始化中的真实行为：没有数据，返回 0/0
             json(r#"{"code":"1","data":{"nonMainClassCapacity":"0","nonMainElectiveNumber":"0"}}"#)
+        } else if mode == Mode::OutageThenFull && path_only.ends_with("capacity.do") {
+            if t0.elapsed().as_secs_f64() < OUTAGE_ENDS {
+                // 还在初始化：没有数据
+                json(r#"{"code":"1","data":{"nonMainClassCapacity":"0","nonMainElectiveNumber":"0"}}"#)
+            } else {
+                // 系统回来了，容量接口开始回真实数字 —— 但一个空位也没有。
+                // 脚本据此只会安静地只读轮询，写请求一发都不会发。
+                json(r#"{"code":"1","data":{"nonMainClassCapacity":"2","nonMainElectiveNumber":"2"}}"#)
+            }
         } else {
             json(r#"{"code":"1","data":{"campus":"01"},"dataList":[]}"#)
         };
