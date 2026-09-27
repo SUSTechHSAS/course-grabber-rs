@@ -859,11 +859,10 @@ fn forever_polls_past_the_window_and_honours_poll() {
             "--forever",
             "--window",
             "2.0",
-            // 故意用默认的爆发期长度：常驻**永远不算爆发**（那是"放课瞬间盲打 3 发"，
-            // 跟首发是同一件事）。用 0 的话这条测试就白测了 —— 也不会发现
-            // "过点后启动 → 开头 5 秒算爆发 → 半秒白扔 3 发写请求"那个 bug。
+            // `--burst 0` = 不爆发，纯轮询。这条测的是**稳态**，爆发期由下面两条
+            // 专门的测试盯着，混在一起就分不清"稳态在写"还是"只在爆发时写"。
             "--burst",
-            "5.0",
+            "0.0",
             "--interval",
             "1.0",
             "--poll",
@@ -883,9 +882,7 @@ fn forever_polls_past_the_window_and_honours_poll() {
         members: vec![tgt("000000000000000000000001", "A班", 0, "星期三-3-5")],
     }];
     let state = State::new();
-    // 目标时刻放到未来：这条测的是**稳态**（爆发期是另一条测试的事）。
-    // 不这么做的话开头那 3 发盲打会进来，就分不清"稳态在写"还是"只在爆发时写"了。
-    let fire_at = timeutil::unix_now() + 30.0;
+    let fire_at = timeutil::unix_now();
     let worker = {
         let school = Arc::clone(&school);
         let state = Arc::clone(&state);
@@ -930,19 +927,61 @@ fn forever_polls_past_the_window_and_honours_poll() {
     mock.close();
 }
 
-/// 爆发期：**在目标时刻开始**，而且学校一给出正常业务回复就提前收掉。
+/// 爆发期那两条测试共用的参数：常驻 + 小间隔，跑得快。
+fn burst_args(burst: &str) -> Arc<cli::Args> {
+    match cli::parse(
+        [
+            "--url",
+            "http://x/y.do?token=t",
+            "--live",
+            "--forever",
+            "--burst",
+            burst,
+            "--interval",
+            "0.3",
+            "--poll",
+            "2",
+        ]
+        .iter()
+        .map(|s| s.to_string()),
+    )
+    .unwrap()
+    {
+        cli::Parsed::Run(a) => Arc::new(*a),
+        _ => unreachable!(),
+    }
+}
+
+/// 写请求时间轴上有没有"0.8 秒内连着 3 发" —— 那是**爆发期**的签名（每片盲打 3 个候选）。
+/// 系统不可用期间是每 0.6 秒探 1 发，不会出现这种成组。
+fn has_burst_group(stamps: &[f64], from: f64, to: f64) -> bool {
+    let mut v: Vec<f64> = stamps
+        .iter()
+        .copied()
+        .filter(|t| *t >= from && *t <= to)
+        .collect();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    v.windows(3).any(|w| w[2] - w[0] <= 0.8)
+}
+
+fn burst_group_of(name: &str) -> Vec<Group> {
+    vec![Group {
+        name: name.to_string(),
+        members: vec![
+            tgt("000000000000000000000001", "A班", 0, name),
+            tgt("000000000000000000000002", "B班", 0, name),
+            tgt("000000000000000000000003", "C班", 0, name),
+        ],
+    }]
+}
+
+/// `--burst` 是爆发的**实际时长**：系统确认可用之后才起算，跑满就收。
 ///
-/// 这条是用户的明确要求（"forever 也应该在目标时间……开始爆发，同时爆发本身应持续
-/// 一段时间"）加上实测凑出来的形状：
-/// * 放课瞬间学校回的是「选课系统正在初始化」⇒ 判决是 Busy ⇒ 爆发**继续**，
-///   一直爆到系统真的可用（09-26 约 20s、09-27 约 71s、09-25 约 3 分钟）；
-/// * 学校一旦回正常判决（比如「超过课容量」）⇒ 连续 3 次就收，回到"读到空位才写"。
-///
-/// 假服务端这里回的是"满员"，所以**只有爆发期才会发写请求** —— 写请求的条数和
-/// 时间点本身就是断言。
+/// 假服务端这里容量接口一直回真实数字（满员）—— 也就是说"系统可用"从第一片就成立，
+/// 所以爆发期该立刻开始。（满员时正常轮询是**一发都不写**的，所以写请求本身就是
+/// 爆发期的证据。）
 #[test]
-fn burst_starts_at_the_target_and_stops_once_the_school_answers() {
-    let start_unix = timeutil::unix_now();
+fn burst_runs_its_full_duration_once_the_system_is_usable() {
     let mock = Mock::start(Mode::AlwaysFull, vec![]);
     let ep = endpoints(mock.port);
     let school = School::new(
@@ -956,79 +995,102 @@ fn burst_starts_at_the_target_and_stops_once_the_school_answers() {
     school.set_code(STUDENT);
     school.set_pacer(Arc::new(WritePacer::new(3, 1.0, 0.15, 0.10)));
 
-    let args = match cli::parse(
-        [
-            "--url",
-            "http://x/y.do?token=t",
-            "--live",
-            "--forever",
-            "--burst",
-            "5.0",
-            "--interval",
-            "0.3",
-            "--poll",
-            "2",
-        ]
-        .iter()
-        .map(|s| s.to_string()),
-    )
-    .unwrap()
-    {
-        cli::Parsed::Run(a) => *a,
-        _ => unreachable!(),
-    };
-
-    let groups = vec![Group {
-        name: "星期三-3-5".to_string(),
-        members: vec![
-            tgt("000000000000000000000001", "A班", 0, "星期三-3-5"),
-            tgt("000000000000000000000002", "B班", 0, "星期三-3-5"),
-            tgt("000000000000000000000003", "C班", 0, "星期三-3-5"),
-        ],
-    }];
     let state = State::new();
-    // 目标时刻放在 1.5 秒后：爆发期在**那之后**才开始
-    let fire_at = start_unix + 1.5;
     let worker = {
         let school = Arc::clone(&school);
         let state = Arc::clone(&state);
+        let args = burst_args("2.0");
         std::thread::spawn(move || {
             grab::retry_loop(
                 school,
                 STUDENT.to_string(),
                 "BATCH1".to_string(),
                 "01".to_string(),
-                groups,
+                burst_group_of("星期三-3-5"),
                 state,
-                Arc::new(args),
-                fire_at,
+                args,
+                timeutil::unix_now(),
                 0.35,
                 grab::Gate::new(),
             )
         })
     };
-    std::thread::sleep(std::time::Duration::from_secs(4));
+    std::thread::sleep(std::time::Duration::from_secs(5));
     state.finish_quiet();
     worker.join().unwrap();
 
     let writes = mock.writes.lock().unwrap().clone();
     assert!(
-        writes.len() >= 3,
-        "目标时刻该来一轮盲打（满员时只有爆发期会写）：{writes:?}"
+        has_burst_group(&writes, 0.0, 4.5),
+        "系统可用之后就该开始盲打（每片 3 个候选）：{writes:?}"
     );
-    // 目标时刻之前一发都不该有（爆发期锚在目标时刻，不是锚在启动时刻）
-    let fire_rel = fire_at - start_unix;
-    let early: Vec<f64> = writes.iter().copied().filter(|t| *t < fire_rel - 0.6).collect();
-    assert!(
-        early.is_empty(),
-        "目标时刻之前不该有写请求（爆发期锚在 {fire_rel:.2}s）：{writes:?}"
-    );
-    // 学校一给正常判决（这里是"满员"）就该收：最后一发之后安静了至少 1 秒
+    let first = writes.iter().cloned().fold(f64::MAX, f64::min);
     let last = writes.iter().cloned().fold(f64::MIN, f64::max);
-    let quiet = mock.t0.elapsed().as_secs_f64() - last;
     assert!(
-        quiet >= 1.0,
-        "爆发期没在服务恢复后收住（最后一发在 {last:.2}s，之后只安静了 {quiet:.2}s）：{writes:?}"
+        last - first >= 1.5,
+        "--burst=2 该是**实际时长**（实际只持续了 {:.2}s）：{writes:?}",
+        last - first
+    );
+    assert!(
+        last - first <= 4.5,
+        "爆发该收住，不该一路爆下去（持续了 {:.2}s）：{writes:?}",
+        last - first
+    );
+    // 收尾之后安静下来（允许偶发一发"读容量失败 → 探针写"）
+    let tail = writes.iter().filter(|t| **t > 4.5).count();
+    assert!(tail <= 1, "爆发结束之后不该还在写：{writes:?}");
+    mock.close();
+}
+
+/// 学校重排期间**不**盲打（那段时间每 0.6 秒探 1 发就够，多打必被拒），
+/// 等它重新可用之后才爆 —— 正是用户点出的"已过点时也可能仍处于系统未恢复"。
+#[test]
+fn no_burst_while_the_school_rebuilds_then_it_bursts_when_it_comes_back() {
+    let mock = Mock::start(Mode::OutageThenFull, vec![]);
+    let ep = endpoints(mock.port);
+    let school = School::new(
+        Arc::clone(&ep),
+        "tok",
+        "JSESSIONID=x",
+        "http://x/y.do?token=tok",
+        4.0,
+        None,
+    );
+    school.set_code(STUDENT);
+    school.set_pacer(Arc::new(WritePacer::new(3, 1.0, 0.15, 0.10)));
+
+    let state = State::new();
+    let worker = {
+        let school = Arc::clone(&school);
+        let state = Arc::clone(&state);
+        let args = burst_args("2.0");
+        std::thread::spawn(move || {
+            grab::retry_loop(
+                school,
+                STUDENT.to_string(),
+                "BATCH1".to_string(),
+                "01".to_string(),
+                burst_group_of("星期三-3-5"),
+                state,
+                args,
+                timeutil::unix_now(),
+                0.35,
+                grab::Gate::new(),
+            )
+        })
+    };
+    std::thread::sleep(std::time::Duration::from_secs(8));
+    state.finish_quiet();
+    worker.join().unwrap();
+
+    let writes = mock.writes.lock().unwrap().clone();
+    assert!(
+        !has_burst_group(&writes, 0.0, OUTAGE_ENDS - 0.2),
+        "系统还在重排时不该盲打（那段时间只该每 0.6 秒探 1 发）：{writes:?}"
+    );
+    assert!(
+        has_burst_group(&writes, OUTAGE_ENDS, OUTAGE_ENDS + 3.5),
+        "系统重新可用之后就该爆：{writes:?}"
     );
     mock.close();
 }

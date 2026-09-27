@@ -1931,15 +1931,24 @@ pub fn retry_loop(
             (start - timeutil::unix_now()).clamp(0.0, 0.05),
         ));
     }
-    // 爆发期 = 放课时刻附近的高强度试探（不读容量、每片盲打最多 3 个候选）。
+    // 爆发期：**系统确认可用之后**，再盲打 `--burst` 秒（不读容量、每片最多 3 个候选）。
     //
-    // 这个 `burst_until` 只是**上限**：真正什么时候结束由学校决定 —— 它一给出正常业务
-    // 回复就收（见下面"服务回来了就收"那段）。所以上限给宽松些没关系：5 秒肯定不够，
-    // 学校在放课瞬间要把选课子系统推倒重排，实测重新可用要 20 秒起步
-    // （09-26 约 20s、09-27 约 71s，09-25 那次初始化持续了约 3 分钟）。
-    let mut burst_until = fire_at + args.burst;
+    // `--burst` 是爆发的**实际时长**，不是"从放课时刻起算的窗口"。理由：学校在放课
+    // 瞬间要把整个选课子系统推倒重排（实测重新可用要 20 秒起步：09-26 约 20s、
+    // 09-27 约 71s、09-25 约 3 分钟），那段等待不该算进爆发时长 —— 而位子恰恰是
+    // 系统重新可用之后才出现的。
+    //
+    // 锚点 = 第一次确认系统可用。两个来源，谁先来算谁：
+    //   * 容量接口给出**真实数字**（这一片刚读过）—— 主要来源。已过点启动时系统
+    //     通常已经正常，于是"立刻"就开始爆；还在重排就等它恢复（用户特意点出的情况：
+    //     已过点也可能仍处于系统未恢复时）。
+    //   * 写请求连续几次拿到正常业务判决（容量接口读不出来时的兜底）。
+    // 系统一直不恢复就**没有**爆发期：那段时间按 09-25 的教训每 0.6 秒探一发
+    // （每发必被拒，多打没意义），而探针本身正好能在恢复的第一时间发现它。
+    let mut burst_end = 0.0f64;
+    let mut burst_anchored = false;
     let mut normal_streak = 0usize;
-    const BURST_END_STREAK: usize = 3;
+    const BURST_BACK_STREAK: usize = 3;
     // `--forever`：不设上限，一直轮转下去
     let deadline = if args.forever {
         f64::INFINITY
@@ -2003,12 +2012,8 @@ pub fn retry_loop(
             // 跟首发那 3 发是同一件事的另一半。2026-09-27 实测：`--forever` 在过点后
             // 启动时 fire_at = 现在，于是开头 5 秒算爆发 —— 半秒内白扔 3 发写请求
             // （每一发都只会被回「超过课容量」），跟"低频写"是矛盾的。
-            // 只在放课时刻**附近**才算爆发：常驻可能提前几小时启动，不设下界的话
-            // 整个下午都在"爆发"（不读容量、每片盲打 3 发）。
-            // 过点启动时 `fire_at = 现在`，所以开头也会爆一下 —— 这是有意的：代价就是
-            // 开头那 3 发（学校一给正常判决就收），换来的是"万一这会儿正好有人退课"
-            // 也不必等下一轮读容量。
-            let in_burst = now >= fire_at - 0.5 && now < burst_until;
+            // 爆发期从"确认系统可用"那一刻开始计时，跟放课时刻本身无关
+            let in_burst = now < burst_end;
             let base_gap = if in_burst { args.interval } else { poll_gap };
             let mut round_gap = base_gap.max(pace); // 被限流过就按退避后的节奏走
             let t_round = timeutil::unix_now();
@@ -2020,15 +2025,13 @@ pub fn retry_loop(
             let mut picks: Vec<Target> = Vec::new();
             let mut capacity_alive = false;
             if in_burst {
-                // 放课瞬间（`--burst` 秒内）保持原样：不读容量，直接用提交当探针 ——
-                // 抢的就是那几百毫秒，连扫最多 3 个候选一起打。之后一律回到
-                // "一个时间片一个候选"。
-                let from = oi.saturating_sub(1);
-                let upto = (from + 3).min(order.len());
-                for (g2, m2) in &order[from..upto] {
+                // 爆发期：不读容量，把轮转顺序里**优先级最高的 3 个**候选各打一发。
+                // 系统刚恢复的那几十秒，位子出现得比读接口快，所以直接用提交当探针。
+                // （以前这里是"从游标处往后取 3 个"，位置凑巧时会只取到 1 个 ——
+                //  爆发期的形状就不确定了。现在固定取前 3 个。）
+                for (g2, m2) in order.iter().take(3) {
                     picks.push(groups[*g2].members[*m2].clone());
                 }
-                oi = upto;
             } else {
                 match has_slot(&school, &target.tc, &batch) {
                     Some(true) => {
@@ -2039,6 +2042,16 @@ pub fn retry_loop(
                     // 0/0 之类的"读不到"：照打，不因为读失败漏机会
                     None => picks.push(target.clone()),
                 }
+            }
+            // 锚定爆发期：容量接口能读出真实数字 = 系统真的可用了
+            if !burst_anchored && capacity_alive && args.burst > 0.0 {
+                burst_anchored = true;
+                burst_end = timeutil::unix_now() + args.burst;
+                info(&format!(
+                    "  系统已可用 —— 爆发期 {:.0}s（到 {}），之后回到「读到空位才写」",
+                    args.burst,
+                    timeutil::civil(burst_end).hms()
+                ));
             }
             if capacity_alive && outage_since > 0.0 {
                 // **第二冲突组整晚一发没试**的根因就在这儿（2026-09-27 实战）。
@@ -2163,17 +2176,28 @@ pub fn retry_loop(
                             info(&format!("  ✓ 服务恢复（写请求已经回正常业务判决，停机 {back:.0}s）"));
                             outage_since = 0.0;
                         }
-                        // 爆发期：学校开始回正常业务判决（不是"正在初始化"）就说明它回来了，
-                        // 再爆下去只是拿写额度去撞满员班 —— 回到 --poll 的节奏。
-                        // 放课那会儿判决是 Busy（正在初始化），所以它会一直爆到系统真的可用。
-                        if verdict == Verdict::Busy {
-                            normal_streak = 0;
-                        } else {
+                        // 系统回来了没有：正常业务判决才算数。
+                        // 「正在初始化」= 还没好；5xx/超时 = 服务器自己不行；会话过期 = 被踢了
+                        // （那条由自动重登录兜着）—— 这几种都不算"恢复"。
+                        let business_ok = !matches!(
+                            verdict,
+                            Verdict::Busy | Verdict::Overload | Verdict::Expired
+                        );
+                        if business_ok {
                             normal_streak += 1;
-                            if in_burst && normal_streak >= BURST_END_STREAK {
-                                info("  服务已恢复，爆发期结束 —— 回到「读到空位才写」");
-                                burst_until = 0.0;
+                            // 容量接口读不出来时的兜底锚点（正常情况上面那段已经锚过了）
+                            if !burst_anchored && normal_streak >= BURST_BACK_STREAK && args.burst > 0.0
+                            {
+                                burst_anchored = true;
+                                burst_end = timeutil::unix_now() + args.burst;
+                                info(&format!(
+                                    "  系统已可用（写请求回了正常判决）—— 爆发期 {:.0}s（到 {}）",
+                                    args.burst,
+                                    timeutil::civil(burst_end).hms()
+                                ));
                             }
+                        } else {
+                            normal_streak = 0;
                         }
                         if verdict == Verdict::WindowClosed {
                             closed_streak += 1;

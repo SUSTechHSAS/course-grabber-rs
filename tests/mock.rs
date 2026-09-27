@@ -357,8 +357,11 @@ fn serve(
             }
             let in_outage = mode == Mode::InitOutage
                 || (mode == Mode::OutageThenFull && t0.elapsed().as_secs_f64() < OUTAGE_ENDS);
-            if mode == Mode::AlwaysFull {
-                // 满员：写请求会被业务性地拒掉（可重试）
+            if mode == Mode::AlwaysFull || (mode == Mode::OutageThenFull && !in_outage) {
+                // 满员：写请求会被业务性地拒掉（可重试）。
+                // OutageThenFull 停机结束后也是"满员" —— 这个模式模拟的正是
+                // "系统回来了，但所有候选都满着"（那才是常态），回成功会让 settle()
+                // 复核 2.5 秒，把爆发期的节奏整个拖没。
                 json(r#"{"code":"0","msg":"该课程超过课容量"}"#)
             } else if in_outage {
                 // 真实措辞：放课瞬间学校就是这个状态，而且**它被算作可重试**
