@@ -1931,7 +1931,15 @@ pub fn retry_loop(
             (start - timeutil::unix_now()).clamp(0.0, 0.05),
         ));
     }
-    let burst_until = fire_at + args.burst;
+    // 爆发期 = 放课时刻附近的高强度试探（不读容量、每片盲打最多 3 个候选）。
+    //
+    // 这个 `burst_until` 只是**上限**：真正什么时候结束由学校决定 —— 它一给出正常业务
+    // 回复就收（见下面"服务回来了就收"那段）。所以上限给宽松些没关系：5 秒肯定不够，
+    // 学校在放课瞬间要把选课子系统推倒重排，实测重新可用要 20 秒起步
+    // （09-26 约 20s、09-27 约 71s，09-25 那次初始化持续了约 3 分钟）。
+    let mut burst_until = fire_at + args.burst;
+    let mut normal_streak = 0usize;
+    const BURST_END_STREAK: usize = 3;
     // `--forever`：不设上限，一直轮转下去
     let deadline = if args.forever {
         f64::INFINITY
@@ -1995,7 +2003,12 @@ pub fn retry_loop(
             // 跟首发那 3 发是同一件事的另一半。2026-09-27 实测：`--forever` 在过点后
             // 启动时 fire_at = 现在，于是开头 5 秒算爆发 —— 半秒内白扔 3 发写请求
             // （每一发都只会被回「超过课容量」），跟"低频写"是矛盾的。
-            let in_burst = !args.forever && now >= fire_at - 0.5 && now < burst_until;
+            // 只在放课时刻**附近**才算爆发：常驻可能提前几小时启动，不设下界的话
+            // 整个下午都在"爆发"（不读容量、每片盲打 3 发）。
+            // 过点启动时 `fire_at = 现在`，所以开头也会爆一下 —— 这是有意的：代价就是
+            // 开头那 3 发（学校一给正常判决就收），换来的是"万一这会儿正好有人退课"
+            // 也不必等下一轮读容量。
+            let in_burst = now >= fire_at - 0.5 && now < burst_until;
             let base_gap = if in_burst { args.interval } else { poll_gap };
             let mut round_gap = base_gap.max(pace); // 被限流过就按退避后的节奏走
             let t_round = timeutil::unix_now();
@@ -2149,6 +2162,18 @@ pub fn retry_loop(
                             let back = timeutil::unix_now() - outage_since;
                             info(&format!("  ✓ 服务恢复（写请求已经回正常业务判决，停机 {back:.0}s）"));
                             outage_since = 0.0;
+                        }
+                        // 爆发期：学校开始回正常业务判决（不是"正在初始化"）就说明它回来了，
+                        // 再爆下去只是拿写额度去撞满员班 —— 回到 --poll 的节奏。
+                        // 放课那会儿判决是 Busy（正在初始化），所以它会一直爆到系统真的可用。
+                        if verdict == Verdict::Busy {
+                            normal_streak = 0;
+                        } else {
+                            normal_streak += 1;
+                            if in_burst && normal_streak >= BURST_END_STREAK {
+                                info("  服务已恢复，爆发期结束 —— 回到「读到空位才写」");
+                                burst_until = 0.0;
+                            }
                         }
                         if verdict == Verdict::WindowClosed {
                             closed_streak += 1;
