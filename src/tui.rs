@@ -2163,6 +2163,20 @@ impl App {
                     format!("第 {} 门", ci + 1)
                 }
             };
+            // query_content 和类别对不上是很隐蔽的错：慕课之外带着 `MOOC:` 开关，
+            // 目录查询会返回空 —— 表现是"目录里查不到这门课"，从报错里看不出原因。
+            // （2026-09-27：用户那门线性代数的 query_content 就是 `MOOC:2,{keyword}`，
+            //  于是预检查目录一直是 0 条。）
+            let qt = course.text("query_content");
+            if qt.contains("MOOC:") && !course.text("class_type").eq_ignore_ascii_case("MOOC") {
+                v.push((
+                    Level::Warn,
+                    format!(
+                        "「{who}」的 query_content 里带着 MOOC: 开关，但类别填的是 {} —— 目录查询大概会返回空（慕课之外不该带它）",
+                        course.text("class_type")
+                    ),
+                ));
+            }
             for (i, item) in c.iter().enumerate() {
                 if item.text("id").trim().is_empty() {
                     v.push((Level::Err, format!("「{who}」候选 [{i}] 缺 id")));
@@ -3973,6 +3987,31 @@ mod tests {
         assert_eq!(
             app.raw.array("courses")[0].array("candidates").len(),
             before - 1
+        );
+    }
+
+    /// `query_content` 和类别对不上要报出来 —— 这是"目录里查不到这门课"的常见原因，
+    /// 从任何报错里都看不出来（2026-09-27 实战：线代那门带着 MOOC:2, 却填的是 FAWKC）。
+    #[test]
+    fn mooc_query_on_a_non_mooc_course_is_flagged() {
+        let mut app = example_app();
+        assert!(
+            !app.problems().iter().any(|(_, s)| s.contains("MOOC: 开关")),
+            "模板本身是干净的，不该报"
+        );
+        app.raw.ensure_arr("courses")[0].set_key("class_type", Json::str("FAWKC"));
+        app.raw.ensure_arr("courses")[0].set_key("query_content", Json::str("MOOC:2,{keyword}"));
+        let hit = app
+            .problems()
+            .iter()
+            .any(|(_, s)| s.contains("MOOC: 开关") && s.contains("FAWKC"));
+        assert!(hit, "该报出来：{:?}", app.problems());
+
+        // 真是慕课的话就不该报
+        app.raw.ensure_arr("courses")[0].set_key("class_type", Json::str("MOOC"));
+        assert!(
+            !app.problems().iter().any(|(_, s)| s.contains("MOOC: 开关")),
+            "类别就是 MOOC，带着开关是对的"
         );
     }
 

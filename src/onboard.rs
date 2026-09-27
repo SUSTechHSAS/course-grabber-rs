@@ -1183,7 +1183,15 @@ pub fn fetch_catalog(
         let mut courses_seen = 0usize;
         loop {
             let got = school
-                .catalog_page(&creds.student_id, &batch_code, &campus, "", code, page)
+                .catalog_page(
+                    &creds.student_id,
+                    &batch_code,
+                    &campus,
+                    "",
+                    code,
+                    crate::grab::query_template_for(code),
+                    page,
+                )
                 .map_err(|e| format!("查课程目录失败（{name}）: {}", e.message()))?;
             let (courses, total) = (got.courses, got.total);
             for r in got.rows {

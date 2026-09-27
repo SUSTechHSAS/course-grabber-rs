@@ -784,8 +784,17 @@ impl School {
         keyword: &str,
         class_type: &str,
     ) -> Result<Vec<CatalogRow>, SchoolError> {
+        // 预检按"这门课的配置"查（每门课的 query_content 可以不同）
         Ok(self
-            .catalog_page(code, batch, campus, keyword, class_type, 0)?
+            .catalog_page(
+                code,
+                batch,
+                campus,
+                keyword,
+                class_type,
+                &self.ep.query_content,
+                0,
+            )?
             .rows)
     }
 
@@ -793,6 +802,7 @@ impl School {
     ///
     /// `page` 从 0 开始（前端就是这么传的）。分页要看的两个数是**课程条数**：
     /// `totalCount` 是课程数，而 `dataList` 每一项带多个教学班 —— 拿教学班数去比会永远翻不完。
+    #[allow(clippy::too_many_arguments)]
     pub fn catalog_page(
         &self,
         code: &str,
@@ -800,6 +810,7 @@ impl School {
         campus: &str,
         keyword: &str,
         class_type: &str,
+        query_content: &str,
         page: i64,
     ) -> Result<CatalogPage, SchoolError> {
         let setting = Json::obj(vec![
@@ -815,7 +826,7 @@ impl School {
                     ("checkCapacity", Json::str("2")),
                     (
                         "queryContent",
-                        Json::str(self.ep.query_content.replace("{keyword}", keyword)),
+                        Json::str(query_content.replace("{keyword}", keyword)),
                     ),
                 ]),
             ),
@@ -1051,6 +1062,20 @@ impl School {
         wire.extend_from_slice(b"\r\n\r\n");
         wire.extend_from_slice(body.as_bytes());
         wire
+    }
+}
+
+/// 目录查询 `queryContent` 的模板：**按类别**决定，跟"哪门课"无关。
+///
+/// 慕课要带 `MOOC:2,` 那个开关才查得到（config.example.json 里也是这么写的），
+/// 其余类别就是关键词本身。界面"每一类都拉"时绝不能用某门课的 query_content 去套 ——
+/// 那门课要是慕课，别的类别就一个都查不出来了（2026-09-27：用户那门线代的
+/// query_content 就是 `MOOC:2,{keyword}`，于是预检查目录一直是 0 条）。
+pub fn query_template_for(class_type: &str) -> &'static str {
+    if class_type.eq_ignore_ascii_case("MOOC") {
+        "MOOC:2,{keyword}"
+    } else {
+        "{keyword}"
     }
 }
 
@@ -2637,37 +2662,52 @@ pub fn main(mut args: Args) -> Result<u8, String> {
     });
 
     if args.offline {
-        log::log("\n--offline：不联网。下面是提交时会发送的请求体：");
-        let first_tc = args
-            .priority
-            .clone()
-            .unwrap_or_else(|| {
-                ep.candidates
-                    .first()
-                    .map(|c| c.id.clone())
-                    .unwrap_or_else(|| "<教学班ID>".to_string())
-            })
-            .split(',')
-            .next()
-            .unwrap_or("<教学班ID>")
-            .to_string();
-        let demo = Json::obj(vec![(
-            "data",
-            Json::obj(vec![
-                ("operationType", Json::str("1")),
-                (
-                    "studentCode",
-                    Json::str(args.student.clone().unwrap_or_else(|| "<学号>".to_string())),
-                ),
-                ("electiveBatchCode", Json::str("<批次>")),
-                ("teachingClassId", Json::str(first_tc)),
-                ("isMajor", Json::str(ep.is_major.clone())),
-                ("campus", Json::str("<校区>")),
-                ("teachingClassType", Json::str(ep.class_type.clone())),
-            ]),
-        )]);
-        log::log(&format!("  POST {}", ep.path("volunteer")));
-        log::log(&format!("  addParam={}", demo.to_compact()));
+        // 多课程：**每门课各打一发样例**。只打第一门的话，另外两门的报文长什么样
+        // 就完全看不到，而 `isMajor` / `teachingClassType` 正是最容易填错、也最难
+        // 从报错里看出来的两个字段。
+        log::log("\n--offline：不联网。下面是提交时会发送的请求体（每门课各一发样例）：");
+        for (ci, c) in courses_used.iter().enumerate() {
+            let pick = |suffix: &str| -> bool {
+                c.candidates.iter().any(|x| x.id.ends_with(suffix))
+            };
+            let tc = args
+                .priority
+                .as_ref()
+                .and_then(|p| {
+                    p.split(',')
+                        .map(|s| s.trim())
+                        .find(|s| !s.is_empty() && pick(s))
+                        .map(|s| s.to_string())
+                })
+                .or_else(|| c.candidates.first().map(|x| x.id.clone()))
+                .unwrap_or_else(|| "<教学班ID>".to_string());
+            let tc_type = c
+                .candidates
+                .iter()
+                .find(|x| x.id == tc)
+                .and_then(|x| x.tc_type.clone())
+                .unwrap_or_else(|| c.class_type.clone());
+            let demo = Json::obj(vec![(
+                "data",
+                Json::obj(vec![
+                    ("operationType", Json::str("1")),
+                    (
+                        "studentCode",
+                        Json::str(args.student.clone().unwrap_or_else(|| "<学号>".to_string())),
+                    ),
+                    ("electiveBatchCode", Json::str("<批次>")),
+                    ("teachingClassId", Json::str(tc)),
+                    ("isMajor", Json::str(c.is_major.clone())),
+                    ("campus", Json::str("<校区>")),
+                    ("teachingClassType", Json::str(tc_type)),
+                ]),
+            )]);
+            if courses_used.len() > 1 {
+                log::log(&format!("  ── {}. {} ──", ci + 1, c.display()));
+            }
+            log::log(&format!("  POST {}", ep.path("volunteer")));
+            log::log(&format!("  addParam={}", demo.to_compact()));
+        }
         return Ok(0);
     }
 
@@ -3655,6 +3695,17 @@ mod tests {
         assert_eq!(parse_token("http://x/page"), None);
         // 别把 xtoken 当成 token
         assert_eq!(parse_token("http://x/page?xtoken=abc"), None);
+    }
+
+    #[test]
+    fn query_template_depends_on_category_not_on_the_course() {
+        // 慕课那条查询要带开关才查得到；其余类别**绝不能**带上它 ——
+        // 带上了服务端就什么都查不出来（"目录里查不到这门课"）。
+        assert_eq!(query_template_for("MOOC"), "MOOC:2,{keyword}");
+        assert_eq!(query_template_for("mooc"), "MOOC:2,{keyword}");
+        for t in ["FANKC", "FAWKC", "XGXK", "TYKC", ""] {
+            assert_eq!(query_template_for(t), "{keyword}", "类别 {t:?}");
+        }
     }
 
     #[test]
