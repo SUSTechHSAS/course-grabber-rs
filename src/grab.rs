@@ -1589,15 +1589,57 @@ fn session_dead(school: &School, code: &str) -> bool {
 /// 「正在初始化」，这段时间容量接口返回 total=0/used=0 —— 那是"没有数据"，
 /// 不是"没有空位"。旧版把它算成 0-0>0=False（已满），于是脚本在整个放课窗口里
 /// 安静地轮询了 56 秒，一发写请求都没发出去。
-fn has_slot(school: &School, tc_id: &str, batch: &str) -> Option<bool> {
-    let cap = school.capacity(tc_id, batch).ok()?;
-    let total = cap.get("nonMainClassCapacity")?.as_f64()? as i64;
-    let used = cap.get("nonMainElectiveNumber")?.as_f64()? as i64;
+/// 这门课我们算"主选对象"还是"非主选对象" —— 决定了该看哪一栏名额。
+///
+/// * **方案内（FANKC）/ 本班推荐（TJKC）/ 体育（TYKC）**：我们本来就是这门课的
+///   主选对象，名额在**主选**那一栏。非主选那一栏学校压根不公布（一直 0/0）。
+/// * **方案外（FAWKC）/ 校公选（XGXK）/ 慕课（MOOC）**：我们是非主选对象，
+///   能抢的只有**非主选**那一栏 —— 主选栏里的空位是别人的。
+///
+/// 2026-09-27 的教训：以前一律只看非主选，于是那两门方案内课
+/// （思想道德与法治 主选 86/86、大学生心理健康 主选 190/190）在预检里被显示成
+/// "⚠ 无数据"，抢课循环里也从来不去碰它们 —— 白挂一晚。
+fn prefers_main_pool(tc_type: &str, class_type: &str) -> bool {
+    let ty = if tc_type.trim().is_empty() {
+        class_type
+    } else {
+        tc_type
+    };
+    matches!(ty.trim().to_ascii_uppercase().as_str(), "FANKC" | "TJKC" | "TYKC")
+}
+
+/// 这个候选所属课程的 class_type（候选自己写了 `type` 就用它）。
+fn course_class_type(ep: &Endpoints, t: &Target) -> String {
+    t.wire_type()
+        .map(|s| s.to_string())
+        .or_else(|| ep.courses.get(t.course_idx).map(|c| c.class_type.clone()))
+        .unwrap_or_default()
+}
+
+/// 从容量响应里取一栏名额 `(容量, 已选)`。**那一栏没公布就是 None** ——
+/// `total = 0` 既可能是"这一栏不存在"，也可能是"接口还没数据（初始化中）"。
+fn pool_of(cap: &Json, total_key: &str, used_key: &str) -> Option<(i64, i64)> {
+    let total = cap.get(total_key)?.as_f64()? as i64;
     if total <= 0 {
-        // 0=接口还没数据（初始化中），不是"满"
         return None;
     }
-    Some(total - used > 0)
+    let used = cap.get(used_key)?.as_f64()? as i64;
+    Some((total, used))
+}
+
+/// 这个候选还有没有名额。返回 `Some(true)`=有空位、`Some(false)`=已满、
+/// `None`=查不到（查不到就照打，不要因为读失败而漏掉机会）。
+fn has_slot(school: &School, t: &Target, batch: &str) -> Option<bool> {
+    let cap = school.capacity(&t.tc, batch).ok()?;
+    let main = pool_of(&cap, "mainClassCapacity", "mainElectiveNumber");
+    let non = pool_of(&cap, "nonMainClassCapacity", "nonMainElectiveNumber");
+    let prefer_main = prefers_main_pool(
+        t.wire_type().unwrap_or(""),
+        &course_class_type(&school.ep, t),
+    );
+    // 首选那一栏没公布就退回另一栏：宁可多问一句，也不要因为猜错身份而整门课不打
+    let chosen = if prefer_main { main.or(non) } else { non.or(main) };
+    chosen.map(|(total, used)| total - used > 0)
 }
 
 /// 唯一真值：已选课程列表里出现完整 teachingClassID。
@@ -1931,26 +1973,30 @@ pub fn retry_loop(
             (start - timeutil::unix_now()).clamp(0.0, 0.05),
         ));
     }
-    // 四种节奏，按目标时刻和目标时刻之后的表现分段：
+    // 爆发期由**两处各自独立**的触发（用户明确要求："放课前可以爆发，放课时也要爆，
+    // 注意两者时间过近"）：
     //
-    //   ① 目标时刻**之前**：纯轮询。学校这会儿本来就是好的（选课轮次开着），
-    //     没有任何"恢复"可等 —— 这时候爆发纯属白扔写额度。
-    //     2026-09-27 19:56 启动那次就是这么白扔了 30 秒 × 3 发/秒，还把爆发额度
-    //     用光、真正的重排恢复期反而没爆。
-    //   ② 目标时刻之后、**写路径还没证明可用**：探测期 —— 每片打 1 发，专问
-    //     "能受理了吗"。放课那会儿学校重排，写请求会回「正在初始化」。
-    //   ③ 写路径一通（收到第一个非 Busy 的业务判决）：进入爆发期，`--burst` 秒内
-    //     每片盲打 3 个候选。
-    //   ④ 之后回到 ①（纯轮询，读到空位才写）。
+    //   ① **启动那一下**：系统读得到就爆一轮。放课之前也值得爆 —— 位子随时可能被
+    //      退出来，而且这一轮不依赖容量数据准不准。
+    //   ② **放课那一下**：过了目标时刻、**写路径恢复**（收到第一个正常业务判决）
+    //      时再爆一轮。
     //
-    // 锚点为什么必须是**写路径**而不是读路径：实测两者恢复相差 40 秒 ——
-    // 09-27 那晚 20:00:22 会话就回来了、容量也读得到了，但写请求一直回
-    // 「正在初始化」到 20:01:05，之后还反复了十来次。位子只有写路径通了才抢得到，
-    // 所以拿容量读当锚点会让爆发期整段落在"还写不进去"的那段时间里。
+    // 两轮各自都拿到完整的 `--burst`：挨得再近也不互相消耗（`max` 取更晚的结束点，
+    // 所以"启动那一轮还没结束放课就到了"也不会把放课那轮吞掉）。
+    //
+    // 目标时刻之后、"写路径证明自己能受理"之前，是**探测期**：每片 1 发，专问
+    // "能受理了吗"。锚点必须是写路径而不是读路径 —— 实测两者恢复相差 40 秒
+    // （09-27 那晚 20:00:22 会话就回来了、容量也读得到了，但写请求一直回
+    // 「正在初始化」到 20:01:05，之后还反复了十来次）。位子只有写路径通了才抢得到。
     //
     // `--burst` 是爆发的**实际时长**：等写路径恢复的那段（探测期）不算在里面。
     let mut burst_end = 0.0f64;
-    let mut write_alive = false;
+    let mut startup_burst_done = false;
+    let mut release_burst_done = false;
+    let mut accept_ok = false;
+    // 启动时目标时刻就已经过去（`--at` 过点 / `--now`）：不存在"放课那一下"，
+    // 启动那一下就是它 —— 别重复爆两轮。
+    let late_start = timeutil::unix_now() >= fire_at - 0.5;
     // 容量接口对某些候选**一直**回 0/0：学校就是不公布那一栏（比如压根不开"非主选"
     // 名额的班）。这种 0/0 是**结构性**的，跟"初始化中"不是一回事 —— 对它一直照打
     // 就是每秒烧一发写额度（09-27 实测：3 个这样的候选 ≈ 1.1 发/秒，挂一整晚三万多发，
@@ -2017,10 +2063,10 @@ pub fn retry_loop(
         }
         {
             let now = timeutil::unix_now();
-            let after_target = now >= fire_at;              // ① vs ②③
-            let in_burst = now < burst_end;                 // ③
-            // ② 探测期：过了目标时刻、写路径还没证明可用。每片 1 发，专问"能受理了吗"。
-            let in_probe = after_target && !write_alive && !in_burst;
+            let after_target = now >= fire_at;
+            let in_burst = now < burst_end;
+            // 探测期：过了目标时刻、写路径还没证明自己能受理。每片 1 发，专问"能受理了吗"。
+            let in_probe = after_target && !accept_ok && !in_burst;
             let base_gap = if in_burst { args.interval } else { poll_gap };
             let mut round_gap = base_gap.max(pace); // 被限流过就按退避后的节奏走
             let t_round = now;
@@ -2039,7 +2085,7 @@ pub fn retry_loop(
                 picks.push(target.clone());
                 round_gap = round_gap.min(0.6);
             } else {
-                match has_slot(&school, &target.tc, &batch) {
+                match has_slot(&school, &target, &batch) {
                     Some(true) => {
                         capacity_alive = true;
                         capacity_works = true;
@@ -2062,21 +2108,15 @@ pub fn retry_loop(
                     }
                 }
             }
-            if capacity_alive && outage_since > 0.0 {
-                // **第二冲突组整晚一发没试**的根因就在这儿（2026-09-27 实战）。
-                //
-                // 以前"停机结束"只认写请求的判决（Full / 正常回复），而系统恢复之后
-                // 候选全是满员 —— 脚本压根不发写请求，于是 outage_since 一直挂着；
-                // 那时候换组条件里有一句 `outage_since <= 0`，本身就是为"停机期间
-                // 别计时"设的，结果变成**永远不换组**：那晚 306/307/308/309 那一组
-                // 轮询了 9 分钟，而 318 组（4 个非主选名额，是唯一名额多一倍的一组）
-                // 从头到尾没被碰过，"进入冲突组 星期五-3-5" 打印出来的时刻正好是
-                // 窗口截止那一刻。
-                //
-                // 容量接口能读出真实数字（不管有没有空位），同样说明系统回来了，认它。
-                let back = timeutil::unix_now() - outage_since;
-                info(&format!("  ✓ 服务恢复（容量接口已能读到真实数据，停机 {back:.0}s）"));
-                outage_since = 0.0;
+            // ① 启动那一下（只触发一次）：容量接口读得到 = 系统这会儿是好的，扫一轮
+            if !startup_burst_done && capacity_alive && args.burst > 0.0 {
+                startup_burst_done = true;
+                burst_end = burst_end.max(now + args.burst);
+                info(&format!(
+                    "  启动爆发期 {:.0}s（到 {}）：系统读得到、先把优先级最高的 3 个扫一轮",
+                    args.burst,
+                    timeutil::civil(burst_end).hms()
+                ));
             }
             if outage_since > 0.0 && !picks.is_empty() {
                 // 服务端在初始化：多打没意义（每发都会被拒），但必须保持试探而且要快 ——
@@ -2193,20 +2233,27 @@ pub fn retry_loop(
                             Verdict::Busy | Verdict::Overload | Verdict::Expired
                         );
                         if business_ok {
-                            // **写路径通了**才是爆发期的锚点（容量读不作数：实测它比
-                            // 写路径早恢复 40 秒，拿它当锚点会让爆发期整段落在还写不进去
-                            // 的那段时间里）。收到第一个正常业务判决就锚，立刻开爆。
-                            if !write_alive {
-                                write_alive = true;
-                                info("  写路径已恢复（收到正常业务判决）");
+                            // 写路径能受理了（这一条判决就是证据）⇒ 停机结束
+                            if outage_since > 0.0 {
+                                let back = timeutil::unix_now() - outage_since;
+                                info(&format!("  ✓ 写路径已恢复（写请求回了正常业务判决，停机 {back:.0}s）"));
+                                outage_since = 0.0;
                             }
-                            if burst_end <= 0.0 && args.burst > 0.0 {
-                                burst_end = timeutil::unix_now() + args.burst;
-                                info(&format!(
-                                    "  进入爆发期 {:.0}s（到 {}）：每片盲打 3 个候选，之后回到「读到空位才写」",
-                                    args.burst,
-                                    timeutil::civil(burst_end).hms()
-                                ));
+                            // ② 放课那一下：目标时刻之后、写路径刚刚证明自己能受理
+                            let now2 = timeutil::unix_now();
+                            if now2 >= fire_at && !accept_ok {
+                                accept_ok = true;
+                                if !late_start && !release_burst_done && args.burst > 0.0 {
+                                    release_burst_done = true;
+                                    // `max`：启动那一轮还没结束的话，放课这轮照样
+                                    // 从这一刻起拿满 --burst，不互相消耗
+                                    burst_end = burst_end.max(now2 + args.burst);
+                                    info(&format!(
+                                        "  进入放课爆发期 {:.0}s（到 {}）：每片盲打优先级最高的 3 个候选",
+                                        args.burst,
+                                        timeutil::civil(burst_end).hms()
+                                    ));
+                                }
                             }
                         }
                         if verdict == Verdict::WindowClosed {
@@ -3293,20 +3340,29 @@ pub fn main(mut args: Args) -> Result<u8, String> {
                         cap.text("nonMainElectiveNumber"),
                         cap.text("nonMainClassCapacity")
                     );
-                    let total = cap
-                        .get("nonMainClassCapacity")
-                        .and_then(|v| v.as_f64())
-                        .unwrap_or(0.0);
-                    let used = cap
-                        .get("nonMainElectiveNumber")
-                        .and_then(|v| v.as_f64())
-                        .unwrap_or(0.0);
-                    let flag = if total <= 0.0 {
-                        "⚠ 无数据（系统初始化中，接口不可信）"
-                    } else if total - used > 0.0 {
-                        "有空位"
+                    // 看哪一栏由"我们对这门课是什么身份"决定（方案内看主选、
+                    // 方案外看非主选）—— 跟抢课循环用的是同一个判据，显示别撒谎
+                    let prefer_main = prefers_main_pool(
+                        t.wire_type().unwrap_or(""),
+                        &course_class_type(&ep, t),
+                    );
+                    let main_pool = pool_of(&cap, "mainClassCapacity", "mainElectiveNumber");
+                    let non_pool = pool_of(&cap, "nonMainClassCapacity", "nonMainElectiveNumber");
+                    let (chosen, which, watch) = if prefer_main {
+                        (main_pool.or(non_pool), "主选", main_pool.is_some())
                     } else {
-                        "已满"
+                        (non_pool.or(main_pool), "非主选", non_pool.is_some())
+                    };
+                    let flag = match chosen {
+                        None => "⚠ 无数据（两栏都没公布；系统初始化中也会这样）".to_string(),
+                        Some((total, used)) if total - used > 0 => {
+                            format!("有空位（看{which}：{}）", if watch { "" } else { "退到" })
+                        }
+                        Some((total, used)) => format!(
+                            "已满（看{which}{}：{} 个空位）",
+                            if watch { "" } else { "，首选栏没公布、退到" },
+                            total - used
+                        ),
                     };
                     info(&format!(
                         "      {tc} {:<22} 主选 {:>8}  非主选 {:>6}  → {flag}",

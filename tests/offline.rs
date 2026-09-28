@@ -862,12 +862,10 @@ fn forever_polls_past_the_window_and_honours_poll() {
             "--forever",
             "--window",
             "2.0",
-            // 用真实的 --burst（不是 0）：这条测试同时钉住
-            // "目标时刻**之前**不发任何写请求" —— 那正是 2026-09-27 19:56 那次
-            // 白扔 30 秒×3 发/秒的原因（当时锚在"容量读得到"上，而学校那会儿本来就
-            // 好好的，于是启动就开爆）。
+            // 启动爆发期用 1.5 秒：这条测试同时钉住"启动那一轮是**一次性**的" ——
+            // 爆完就回稳态，不会一直爆下去。
             "--burst",
-            "5.0",
+            "1.5",
             "--interval",
             "1.0",
             "--poll",
@@ -882,12 +880,11 @@ fn forever_polls_past_the_window_and_honours_poll() {
         _ => unreachable!(),
     };
 
-    let groups = vec![Group {
-        name: "星期三-3-5".to_string(),
-        members: vec![tgt("000000000000000000000001", "A班", 0, "星期三-3-5")],
-    }];
+    // 3 个候选：爆发期是"每片盲打 3 个"，一个候选看不出形状来
+    let groups = burst_group_of("星期三-3-5");
     let state = State::new();
-    // 目标时刻放到未来 30 秒：测试全程都处于"目标时刻之前"
+    // 目标时刻放到未来 30 秒：这条只关心"启动爆发期 + 之后的稳态"，
+    // 放课那一下由 burst_* 那两条测试盯着
     let fire_at = timeutil::unix_now() + 30.0;
     let worker = {
         let school = Arc::clone(&school);
@@ -919,12 +916,21 @@ fn forever_polls_past_the_window_and_honours_poll() {
         last >= 2.5,
         "常驻模式该跑过 --window 2.0s（最后一次读容量在 {last:.2}s，收工于 {stopped_at:.2}s）"
     );
-    assert_eq!(
-        mock.write_count(),
-        0,
-        "目标时刻之前、候选全满时，一发写请求都不该发（既不该探测、也不该爆发）：{:?}",
+    // 启动那一轮该爆（放课之前也值得爆：位子随时可能被退出来）
+    assert!(
+        has_burst_group(&mock.writes.lock().unwrap(), 0.0, 3.0),
+        "启动爆发期该扫一轮（每片 3 个候选）：{:?}",
         mock.writes.lock().unwrap()
     );
+    // 但它是**一次性**的：爆完就回稳态，候选全满时不再写
+    let tail = mock
+        .writes
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|t| **t > 3.0)
+        .count();
+    assert!(tail <= 1, "启动爆发期只该爆一轮，之后全满就不写了");
     let span = last - caps.first().unwrap().at;
     let rate = (caps.len() as f64 - 1.0) / span.max(0.001);
     assert!(
@@ -1064,6 +1070,96 @@ fn structural_zero_capacity_is_not_probed_with_writes() {
     mock.close();
 }
 
+/// 看哪一栏名额，取决于**我们对这门课是什么身份**：
+/// 方案内（FANKC）看主选、方案外（FAWKC）看非主选。
+///
+/// 2026-09-27 的实战：以前一律只看非主选，用户那两门方案内课（思想道德与法治
+/// 主选 86/86、大学生心理健康 主选 190/190；非主选那一栏是 0/0）在预检里显示成
+/// "⚠ 无数据"，抢课循环里也从来不去碰 —— 白挂一整晚。
+#[test]
+fn the_pool_we_watch_depends_on_the_course_type() {
+    let mock = Mock::start(Mode::PoolSplit, vec![]);
+    let ep = endpoints(mock.port);
+    let school = School::new(
+        Arc::clone(&ep),
+        "tok",
+        "JSESSIONID=x",
+        "http://x/y.do?token=tok",
+        4.0,
+        None,
+    );
+    school.set_code(STUDENT);
+    school.set_pacer(Arc::new(WritePacer::new(3, 1.0, 0.15, 0.10)));
+
+    let args = match cli::parse(
+        [
+            "--url",
+            "http://x/y.do?token=t",
+            "--live",
+            "--forever",
+            "--burst",
+            "0.0",
+            "--interval",
+            "0.3",
+            "--poll",
+            "3",
+        ]
+        .iter()
+        .map(|s| s.to_string()),
+    )
+    .unwrap()
+    {
+        cli::Parsed::Run(a) => *a,
+        _ => unreachable!(),
+    };
+
+    // 001 = 方案内（主选有名额 → 该打）；002 = 方案外（非主选满 → 不该打）
+    let mut a = tgt("000000000000000000000001", "方案内", 0, "星期三-3-5");
+    a.tc_type = Some("FANKC".to_string());
+    let mut b = tgt("000000000000000000000002", "方案外", 1, "星期三-3-5");
+    b.tc_type = Some("FAWKC".to_string());
+    let groups = vec![Group {
+        name: "星期三-3-5".to_string(),
+        members: vec![a, b],
+    }];
+
+    let state = State::for_courses(2);
+    // 目标时刻放未来：全程纯轮询（探测期/爆发期都不掺和）
+    let fire_at = timeutil::unix_now() + 30.0;
+    let worker = {
+        let school = Arc::clone(&school);
+        let state = Arc::clone(&state);
+        std::thread::spawn(move || {
+            grab::retry_loop(
+                school,
+                STUDENT.to_string(),
+                "BATCH1".to_string(),
+                "01".to_string(),
+                groups,
+                state,
+                Arc::new(args),
+                fire_at,
+                0.35,
+                grab::Gate::new(),
+            )
+        })
+    };
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    state.finish_quiet();
+    worker.join().unwrap();
+
+    let submitted = mock.submitted.lock().unwrap().clone();
+    assert!(
+        submitted.iter().any(|id| id.ends_with("000001")),
+        "方案内那门课该按**主选**那一栏判断（主选有空位 → 打）：{submitted:?}"
+    );
+    assert!(
+        !submitted.iter().any(|id| id.ends_with("000002")),
+        "方案外那门课该按**非主选**那一栏判断（非主选满 → 不打；主选那 10 个空位不是我们的）：{submitted:?}"
+    );
+    mock.close();
+}
+
 fn burst_group_of(name: &str) -> Vec<Group> {
     vec![Group {
         name: name.to_string(),
@@ -1160,6 +1256,8 @@ fn no_burst_while_the_school_rebuilds_then_it_bursts_when_it_comes_back() {
     school.set_pacer(Arc::new(WritePacer::new(3, 1.0, 0.15, 0.10)));
 
     let state = State::new();
+    // 目标时刻放未来 1 秒：这样"放课那一下"才会触发（过点启动时它就是启动那一下）
+    let fire_at = timeutil::unix_now() + 1.0;
     let worker = {
         let school = Arc::clone(&school);
         let state = Arc::clone(&state);
@@ -1173,7 +1271,7 @@ fn no_burst_while_the_school_rebuilds_then_it_bursts_when_it_comes_back() {
                 burst_group_of("星期三-3-5"),
                 state,
                 args,
-                timeutil::unix_now(),
+                fire_at,
                 0.35,
                 grab::Gate::new(),
             )

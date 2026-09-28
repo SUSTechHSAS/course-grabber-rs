@@ -76,6 +76,10 @@ pub enum Mode {
     OutageThenFull,
     /// 一直是满的 —— 常驻轮询的常态：只读轮询、一发写请求都不发。
     AlwaysFull,
+    /// 两栏名额故意拧着来：`…001` 主选有名额、非主选那一栏不公布（方案内课的典型样子）；
+    /// `…002` 主选也有名额，但**非主选满了**（方案外课：能抢的只有非主选那一栏）。
+    /// 用来钉住"看哪一栏取决于我们对这门课是什么身份"。
+    PoolSplit,
     /// 有些候选的"非主选"那一栏学校**压根不公布**（一直回 0/0），另一些正常回数字。
     /// 用来测"结构性的 0/0 不该拿写请求去试"。
     MissingNonMain,
@@ -375,6 +379,15 @@ fn serve(
         } else if mode == Mode::InitOutage && path_only.ends_with("capacity.do") {
             // 初始化中的真实行为：没有数据，返回 0/0
             json(r#"{"code":"1","data":{"nonMainClassCapacity":"0","nonMainElectiveNumber":"0"}}"#)
+        } else if mode == Mode::PoolSplit && path_only.ends_with("capacity.do") {
+            // **两栏都公布、而且故意拧着来**：主选有 10 个空位、非主选满。
+            // 这样"看哪一栏"就完全由课程身份决定，两个方向都能钉住：
+            //   方案内（FANKC）→ 看主选 → 有空位 → 该打；
+            //   方案外（FAWKC）→ 看非主选 → 满 → 不该打（主选那 10 个空位不是我们的）。
+            json(
+                r#"{"code":"1","data":{"mainClassCapacity":"20","mainElectiveNumber":"10",
+                     "nonMainClassCapacity":"2","nonMainElectiveNumber":"2"}}"#,
+            )
         } else if mode == Mode::MissingNonMain && path_only.ends_with("capacity.do") {
             let tc = form
                 .iter()
