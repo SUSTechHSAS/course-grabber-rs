@@ -1931,24 +1931,35 @@ pub fn retry_loop(
             (start - timeutil::unix_now()).clamp(0.0, 0.05),
         ));
     }
-    // 爆发期：**系统确认可用之后**，再盲打 `--burst` 秒（不读容量、每片最多 3 个候选）。
+    // 四种节奏，按目标时刻和目标时刻之后的表现分段：
     //
-    // `--burst` 是爆发的**实际时长**，不是"从放课时刻起算的窗口"。理由：学校在放课
-    // 瞬间要把整个选课子系统推倒重排（实测重新可用要 20 秒起步：09-26 约 20s、
-    // 09-27 约 71s、09-25 约 3 分钟），那段等待不该算进爆发时长 —— 而位子恰恰是
-    // 系统重新可用之后才出现的。
+    //   ① 目标时刻**之前**：纯轮询。学校这会儿本来就是好的（选课轮次开着），
+    //     没有任何"恢复"可等 —— 这时候爆发纯属白扔写额度。
+    //     2026-09-27 19:56 启动那次就是这么白扔了 30 秒 × 3 发/秒，还把爆发额度
+    //     用光、真正的重排恢复期反而没爆。
+    //   ② 目标时刻之后、**写路径还没证明可用**：探测期 —— 每片打 1 发，专问
+    //     "能受理了吗"。放课那会儿学校重排，写请求会回「正在初始化」。
+    //   ③ 写路径一通（收到第一个非 Busy 的业务判决）：进入爆发期，`--burst` 秒内
+    //     每片盲打 3 个候选。
+    //   ④ 之后回到 ①（纯轮询，读到空位才写）。
     //
-    // 锚点 = 第一次确认系统可用。两个来源，谁先来算谁：
-    //   * 容量接口给出**真实数字**（这一片刚读过）—— 主要来源。已过点启动时系统
-    //     通常已经正常，于是"立刻"就开始爆；还在重排就等它恢复（用户特意点出的情况：
-    //     已过点也可能仍处于系统未恢复时）。
-    //   * 写请求连续几次拿到正常业务判决（容量接口读不出来时的兜底）。
-    // 系统一直不恢复就**没有**爆发期：那段时间按 09-25 的教训每 0.6 秒探一发
-    // （每发必被拒，多打没意义），而探针本身正好能在恢复的第一时间发现它。
+    // 锚点为什么必须是**写路径**而不是读路径：实测两者恢复相差 40 秒 ——
+    // 09-27 那晚 20:00:22 会话就回来了、容量也读得到了，但写请求一直回
+    // 「正在初始化」到 20:01:05，之后还反复了十来次。位子只有写路径通了才抢得到，
+    // 所以拿容量读当锚点会让爆发期整段落在"还写不进去"的那段时间里。
+    //
+    // `--burst` 是爆发的**实际时长**：等写路径恢复的那段（探测期）不算在里面。
     let mut burst_end = 0.0f64;
-    let mut burst_anchored = false;
-    let mut normal_streak = 0usize;
-    const BURST_BACK_STREAK: usize = 3;
+    let mut write_alive = false;
+    // 容量接口对某些候选**一直**回 0/0：学校就是不公布那一栏（比如压根不开"非主选"
+    // 名额的班）。这种 0/0 是**结构性**的，跟"初始化中"不是一回事 —— 对它一直照打
+    // 就是每秒烧一发写额度（09-27 实测：3 个这样的候选 ≈ 1.1 发/秒，挂一整晚三万多发，
+    // 而且每一发都只会被回「超过课容量」）。
+    // 判据：这一片读到 0/0 时，如果**别的候选能读出真实数字**（接口是好的）而这个候选
+    // 从没读出过，就当它结构性、跳过；否则（接口整体像坏了，或者它以前读出过）
+    // 照打 —— 不因为读失败漏机会（09-25 的教训）。
+    let mut capacity_works = false;
+    let mut seen_capacity: HashSet<String> = HashSet::new();
     // `--forever`：不设上限，一直轮转下去
     let deadline = if args.forever {
         f64::INFINITY
@@ -2005,53 +2016,51 @@ pub fn retry_loop(
             continue;
         }
         {
-            // 爆发期只在放课时刻**附近**才算：常驻可能提前几小时启动，
-            // 不设下界的话整个下午都在"爆发"（不读容量、每片盲打 3 发）。
             let now = timeutil::unix_now();
-            // 常驻**永远不算爆发**：爆发期是"放课瞬间不读容量、每片盲打 3 发"，
-            // 跟首发那 3 发是同一件事的另一半。2026-09-27 实测：`--forever` 在过点后
-            // 启动时 fire_at = 现在，于是开头 5 秒算爆发 —— 半秒内白扔 3 发写请求
-            // （每一发都只会被回「超过课容量」），跟"低频写"是矛盾的。
-            // 爆发期从"确认系统可用"那一刻开始计时，跟放课时刻本身无关
-            let in_burst = now < burst_end;
+            let after_target = now >= fire_at;              // ① vs ②③
+            let in_burst = now < burst_end;                 // ③
+            // ② 探测期：过了目标时刻、写路径还没证明可用。每片 1 发，专问"能受理了吗"。
+            let in_probe = after_target && !write_alive && !in_burst;
             let base_gap = if in_burst { args.interval } else { poll_gap };
             let mut round_gap = base_gap.max(pace); // 被限流过就按退避后的节奏走
-            let t_round = timeutil::unix_now();
+            let t_round = now;
 
             // 这一片要不要出手：
-            //   读到有空位 → 立刻打（"高频只读、低频写、读到就快写"）
-            //   读到已满   → 什么都不做，下一片看下一个候选
-            //   读不到     → 初始化中/容量接口不可信 ⇒ 照打一发探针，不因为读失败漏机会
+            //   爆发期   → 不读容量，优先级最高的 3 个候选各打一发
+            //   探测期   → 1 发，专问"写路径通了吗"（每片 0.6 秒，见下）
+            //   纯轮询   → 读一个候选的容量：有空位就打、已满就跳过、读不到就照打
             let mut picks: Vec<Target> = Vec::new();
             let mut capacity_alive = false;
             if in_burst {
-                // 爆发期：不读容量，把轮转顺序里**优先级最高的 3 个**候选各打一发。
-                // 系统刚恢复的那几十秒，位子出现得比读接口快，所以直接用提交当探针。
-                // （以前这里是"从游标处往后取 3 个"，位置凑巧时会只取到 1 个 ——
-                //  爆发期的形状就不确定了。现在固定取前 3 个。）
                 for (g2, m2) in order.iter().take(3) {
                     picks.push(groups[*g2].members[*m2].clone());
                 }
+            } else if in_probe {
+                picks.push(target.clone());
+                round_gap = round_gap.min(0.6);
             } else {
                 match has_slot(&school, &target.tc, &batch) {
                     Some(true) => {
                         capacity_alive = true;
+                        capacity_works = true;
+                        seen_capacity.insert(target.tc.clone());
                         picks.push(target.clone());
                     }
-                    Some(false) => capacity_alive = true,
-                    // 0/0 之类的"读不到"：照打，不因为读失败漏机会
-                    None => picks.push(target.clone()),
+                    Some(false) => {
+                        capacity_alive = true;
+                        capacity_works = true;
+                        seen_capacity.insert(target.tc.clone());
+                    }
+                    // 0/0 之类的"读不到"：照打（不因为读失败漏机会），但**结构性**的
+                    // 0/0 例外 —— 见上面那段注释
+                    None => {
+                        // 结构性 0/0（别的候选读得到、它从没读到过）就别拿写请求去试
+                        let structural = capacity_works && !seen_capacity.contains(&target.tc);
+                        if !structural {
+                            picks.push(target.clone());
+                        }
+                    }
                 }
-            }
-            // 锚定爆发期：容量接口能读出真实数字 = 系统真的可用了
-            if !burst_anchored && capacity_alive && args.burst > 0.0 {
-                burst_anchored = true;
-                burst_end = timeutil::unix_now() + args.burst;
-                info(&format!(
-                    "  系统已可用 —— 爆发期 {:.0}s（到 {}），之后回到「读到空位才写」",
-                    args.burst,
-                    timeutil::civil(burst_end).hms()
-                ));
             }
             if capacity_alive && outage_since > 0.0 {
                 // **第二冲突组整晚一发没试**的根因就在这儿（2026-09-27 实战）。
@@ -2184,20 +2193,21 @@ pub fn retry_loop(
                             Verdict::Busy | Verdict::Overload | Verdict::Expired
                         );
                         if business_ok {
-                            normal_streak += 1;
-                            // 容量接口读不出来时的兜底锚点（正常情况上面那段已经锚过了）
-                            if !burst_anchored && normal_streak >= BURST_BACK_STREAK && args.burst > 0.0
-                            {
-                                burst_anchored = true;
+                            // **写路径通了**才是爆发期的锚点（容量读不作数：实测它比
+                            // 写路径早恢复 40 秒，拿它当锚点会让爆发期整段落在还写不进去
+                            // 的那段时间里）。收到第一个正常业务判决就锚，立刻开爆。
+                            if !write_alive {
+                                write_alive = true;
+                                info("  写路径已恢复（收到正常业务判决）");
+                            }
+                            if burst_end <= 0.0 && args.burst > 0.0 {
                                 burst_end = timeutil::unix_now() + args.burst;
                                 info(&format!(
-                                    "  系统已可用（写请求回了正常判决）—— 爆发期 {:.0}s（到 {}）",
+                                    "  进入爆发期 {:.0}s（到 {}）：每片盲打 3 个候选，之后回到「读到空位才写」",
                                     args.burst,
                                     timeutil::civil(burst_end).hms()
                                 ));
                             }
-                        } else {
-                            normal_streak = 0;
                         }
                         if verdict == Verdict::WindowClosed {
                             closed_streak += 1;

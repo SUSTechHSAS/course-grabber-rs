@@ -661,8 +661,10 @@ fn full_candidates_after_the_outage_still_roll_to_the_next_group() {
             "--live",
             "--window",
             "4.0",
+            // 这条测的是**纯轮询**下轮转覆盖所有组（09-27 那个 bug）：`--burst 0` 摘掉
+            // 爆发期，目标时刻放未来摘掉探测期（探测期只打写请求、不读容量）。
             "--burst",
-            "0.2",
+            "0.0",
             "--interval",
             "1.0",
             "--poll",
@@ -695,7 +697,8 @@ fn full_candidates_after_the_outage_still_roll_to_the_next_group() {
         groups,
         State::new(),
         Arc::new(args),
-        timeutil::unix_now(),
+        // 目标时刻放未来：全程纯轮询（探测期/爆发期都不掺和）
+        timeutil::unix_now() + 30.0,
         0.35,
         grab::Gate::new(),
     );
@@ -859,10 +862,12 @@ fn forever_polls_past_the_window_and_honours_poll() {
             "--forever",
             "--window",
             "2.0",
-            // `--burst 0` = 不爆发，纯轮询。这条测的是**稳态**，爆发期由下面两条
-            // 专门的测试盯着，混在一起就分不清"稳态在写"还是"只在爆发时写"。
+            // 用真实的 --burst（不是 0）：这条测试同时钉住
+            // "目标时刻**之前**不发任何写请求" —— 那正是 2026-09-27 19:56 那次
+            // 白扔 30 秒×3 发/秒的原因（当时锚在"容量读得到"上，而学校那会儿本来就
+            // 好好的，于是启动就开爆）。
             "--burst",
-            "0.0",
+            "5.0",
             "--interval",
             "1.0",
             "--poll",
@@ -882,7 +887,8 @@ fn forever_polls_past_the_window_and_honours_poll() {
         members: vec![tgt("000000000000000000000001", "A班", 0, "星期三-3-5")],
     }];
     let state = State::new();
-    let fire_at = timeutil::unix_now();
+    // 目标时刻放到未来 30 秒：测试全程都处于"目标时刻之前"
+    let fire_at = timeutil::unix_now() + 30.0;
     let worker = {
         let school = Arc::clone(&school);
         let state = Arc::clone(&state);
@@ -916,7 +922,8 @@ fn forever_polls_past_the_window_and_honours_poll() {
     assert_eq!(
         mock.write_count(),
         0,
-        "稳态下候选全满时一发写请求都不该发（写请求是稀缺资源）"
+        "目标时刻之前、候选全满时，一发写请求都不该发（既不该探测、也不该爆发）：{:?}",
+        mock.writes.lock().unwrap()
     );
     let span = last - caps.first().unwrap().at;
     let rate = (caps.len() as f64 - 1.0) / span.max(0.001);
@@ -962,6 +969,99 @@ fn has_burst_group(stamps: &[f64], from: f64, to: f64) -> bool {
         .collect();
     v.sort_by(|a, b| a.partial_cmp(b).unwrap());
     v.windows(3).any(|w| w[2] - w[0] <= 0.8)
+}
+
+/// 学校对某些候选**一直**回 0/0（那一栏压根不公布）。这种"结构性 0/0"不能拿写请求
+/// 去试 —— 2026-09-27 实测：用户那 3 个这样的候选让脚本每秒烧 1.1 发写请求，
+/// 挂一整晚三万多发，而每一发都只会被回「超过课容量」。
+#[test]
+fn structural_zero_capacity_is_not_probed_with_writes() {
+    let mock = Mock::start(Mode::MissingNonMain, vec![]);
+    let ep = endpoints(mock.port);
+    let school = School::new(
+        Arc::clone(&ep),
+        "tok",
+        "JSESSIONID=x",
+        "http://x/y.do?token=tok",
+        4.0,
+        None,
+    );
+    school.set_code(STUDENT);
+    school.set_pacer(Arc::new(WritePacer::new(3, 1.0, 0.15, 0.10)));
+
+    let args = match cli::parse(
+        [
+            "--url",
+            "http://x/y.do?token=t",
+            "--live",
+            "--forever",
+            "--burst",
+            "0.0",
+            "--interval",
+            "0.3",
+            "--poll",
+            "3",
+        ]
+        .iter()
+        .map(|s| s.to_string()),
+    )
+    .unwrap()
+    {
+        cli::Parsed::Run(a) => *a,
+        _ => unreachable!(),
+    };
+
+    // 001/002 正常回"满"，003 一直回 0/0
+    let groups = vec![Group {
+        name: "星期三-3-5".to_string(),
+        members: vec![
+            tgt("000000000000000000000001", "A班", 0, "星期三-3-5"),
+            tgt("000000000000000000000002", "B班", 0, "星期三-3-5"),
+            tgt("000000000000000000000003", "C班", 0, "星期三-3-5"),
+        ],
+    }];
+    let state = State::new();
+    // 目标时刻放到未来：全程纯轮询（探测期不掺和进来）
+    let fire_at = timeutil::unix_now() + 30.0;
+    let worker = {
+        let school = Arc::clone(&school);
+        let state = Arc::clone(&state);
+        std::thread::spawn(move || {
+            grab::retry_loop(
+                school,
+                STUDENT.to_string(),
+                "BATCH1".to_string(),
+                "01".to_string(),
+                groups,
+                state,
+                Arc::new(args),
+                fire_at,
+                0.35,
+                grab::Gate::new(),
+            )
+        })
+    };
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    state.finish_quiet();
+    worker.join().unwrap();
+
+    assert_eq!(
+        mock.write_count(),
+        0,
+        "全满 + 结构性 0/0 时一发都不该写：{:?}",
+        mock.writes.lock().unwrap()
+    );
+    // 但 0/0 那个候选仍然在被轮询（不是把它整个跳过了）
+    let asked: Vec<String> = mock
+        .calls_to("capacity.do")
+        .iter()
+        .map(|c| c.field("teachingClassId"))
+        .collect();
+    assert!(
+        asked.iter().any(|id| id.ends_with("003")),
+        "0/0 的候选也要继续读容量（读了才知道它什么时候真的放名额）：{asked:?}"
+    );
+    mock.close();
 }
 
 fn burst_group_of(name: &str) -> Vec<Group> {

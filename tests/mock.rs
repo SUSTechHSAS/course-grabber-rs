@@ -76,6 +76,9 @@ pub enum Mode {
     OutageThenFull,
     /// 一直是满的 —— 常驻轮询的常态：只读轮询、一发写请求都不发。
     AlwaysFull,
+    /// 有些候选的"非主选"那一栏学校**压根不公布**（一直回 0/0），另一些正常回数字。
+    /// 用来测"结构性的 0/0 不该拿写请求去试"。
+    MissingNonMain,
     /// 提交什么就"选中"什么：`courseResult.do` 会把提交过的教学班报成已选，
     /// 于是 `settle()` 的复核能真的确认选中。给"抢到一门继续抢下一门""不双选"用。
     AlwaysWin,
@@ -372,6 +375,18 @@ fn serve(
         } else if mode == Mode::InitOutage && path_only.ends_with("capacity.do") {
             // 初始化中的真实行为：没有数据，返回 0/0
             json(r#"{"code":"1","data":{"nonMainClassCapacity":"0","nonMainElectiveNumber":"0"}}"#)
+        } else if mode == Mode::MissingNonMain && path_only.ends_with("capacity.do") {
+            let tc = form
+                .iter()
+                .find(|(k, _)| k == "teachingClassId")
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default();
+            if tc.ends_with("003") {
+                // 这一栏不公布：一直 0/0
+                json(r#"{"code":"1","data":{"nonMainClassCapacity":"0","nonMainElectiveNumber":"0"}}"#)
+            } else {
+                json(r#"{"code":"1","data":{"nonMainClassCapacity":"2","nonMainElectiveNumber":"2"}}"#)
+            }
         } else if mode == Mode::AlwaysFull && path_only.ends_with("capacity.do") {
             // 一直是满的（非主选 2/2）—— 常驻轮询的常态
             json(r#"{"code":"1","data":{"nonMainClassCapacity":"2","nonMainElectiveNumber":"2"}}"#)
