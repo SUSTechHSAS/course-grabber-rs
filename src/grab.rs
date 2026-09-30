@@ -1605,7 +1605,10 @@ fn prefers_main_pool(tc_type: &str, class_type: &str) -> bool {
     } else {
         tc_type
     };
-    matches!(ty.trim().to_ascii_uppercase().as_str(), "FANKC" | "TJKC" | "TYKC")
+    matches!(
+        ty.trim().to_ascii_uppercase().as_str(),
+        "FANKC" | "TJKC" | "TYKC"
+    )
 }
 
 /// 这个候选所属课程的 class_type（候选自己写了 `type` 就用它）。
@@ -1638,7 +1641,11 @@ fn has_slot(school: &School, t: &Target, batch: &str) -> Option<bool> {
         &course_class_type(&school.ep, t),
     );
     // 首选那一栏没公布就退回另一栏：宁可多问一句，也不要因为猜错身份而整门课不打
-    let chosen = if prefer_main { main.or(non) } else { non.or(main) };
+    let chosen = if prefer_main {
+        main.or(non)
+    } else {
+        non.or(main)
+    };
     chosen.map(|(total, used)| total - used > 0)
 }
 
@@ -1881,7 +1888,15 @@ pub fn fire_round(
             let tx = tx.clone();
             let t = t.clone();
             scope.spawn(move || {
-                let res = school.submit_fresh(code, batch, &t.tc, campus, t.wire_type(), t.wire_is_major(), timeout);
+                let res = school.submit_fresh(
+                    code,
+                    batch,
+                    &t.tc,
+                    campus,
+                    t.wire_type(),
+                    t.wire_is_major(),
+                    timeout,
+                );
                 let _ = tx.send((t.tc.clone(), res));
             });
             started += 1;
@@ -2044,7 +2059,10 @@ pub fn retry_loop(
                 info("  没有还能提交的候选了（全被拒或已抢齐），收尾");
                 break;
             }
-            let names: Vec<&str> = order.iter().map(|(g, _)| groups[*g].name.as_str()).collect();
+            let names: Vec<&str> = order
+                .iter()
+                .map(|(g, _)| groups[*g].name.as_str())
+                .collect();
             info(&format!("  新一轮轮转: {names:?}"));
         }
         let (gi, mi) = order[oi];
@@ -2173,7 +2191,15 @@ pub fn retry_loop(
                     .map(|t| {
                         (
                             t.tc.clone(),
-                            school.submit(&code, &batch, &t.tc, &campus, t.wire_type(), t.wire_is_major(), Some(wt)),
+                            school.submit(
+                                &code,
+                                &batch,
+                                &t.tc,
+                                &campus,
+                                t.wire_type(),
+                                t.wire_is_major(),
+                                Some(wt),
+                            ),
                         )
                     })
                     .collect()
@@ -2222,7 +2248,9 @@ pub fn retry_loop(
                         }
                         if outage_since > 0.0 {
                             let back = timeutil::unix_now() - outage_since;
-                            info(&format!("  ✓ 服务恢复（写请求已经回正常业务判决，停机 {back:.0}s）"));
+                            info(&format!(
+                                "  ✓ 服务恢复（写请求已经回正常业务判决，停机 {back:.0}s）"
+                            ));
                             outage_since = 0.0;
                         }
                         // 系统回来了没有：正常业务判决才算数。
@@ -2236,7 +2264,9 @@ pub fn retry_loop(
                             // 写路径能受理了（这一条判决就是证据）⇒ 停机结束
                             if outage_since > 0.0 {
                                 let back = timeutil::unix_now() - outage_since;
-                                info(&format!("  ✓ 写路径已恢复（写请求回了正常业务判决，停机 {back:.0}s）"));
+                                info(&format!(
+                                    "  ✓ 写路径已恢复（写请求回了正常业务判决，停机 {back:.0}s）"
+                                ));
                                 outage_since = 0.0;
                             }
                             // ② 放课那一下：目标时刻之后、写路径刚刚证明自己能受理
@@ -2645,9 +2675,7 @@ pub fn main(mut args: Args) -> Result<u8, String> {
             let hits: Vec<CourseCfg> = ep
                 .courses
                 .iter()
-                .filter(|c| {
-                    c.display().contains(k.as_str()) || c.keyword.contains(k.as_str())
-                })
+                .filter(|c| c.display().contains(k.as_str()) || c.keyword.contains(k.as_str()))
                 .cloned()
                 .collect();
             if hits.is_empty() {
@@ -2763,9 +2791,8 @@ pub fn main(mut args: Args) -> Result<u8, String> {
         // 从报错里看出来的两个字段。
         log::log("\n--offline：不联网。下面是提交时会发送的请求体（每门课各一发样例）：");
         for (ci, c) in courses_used.iter().enumerate() {
-            let pick = |suffix: &str| -> bool {
-                c.candidates.iter().any(|x| x.id.ends_with(suffix))
-            };
+            let pick =
+                |suffix: &str| -> bool { c.candidates.iter().any(|x| x.id.ends_with(suffix)) };
             let tc = args
                 .priority
                 .as_ref()
@@ -3342,10 +3369,8 @@ pub fn main(mut args: Args) -> Result<u8, String> {
                     );
                     // 看哪一栏由"我们对这门课是什么身份"决定（方案内看主选、
                     // 方案外看非主选）—— 跟抢课循环用的是同一个判据，显示别撒谎
-                    let prefer_main = prefers_main_pool(
-                        t.wire_type().unwrap_or(""),
-                        &course_class_type(&ep, t),
-                    );
+                    let prefer_main =
+                        prefers_main_pool(t.wire_type().unwrap_or(""), &course_class_type(&ep, t));
                     let main_pool = pool_of(&cap, "mainClassCapacity", "mainElectiveNumber");
                     let non_pool = pool_of(&cap, "nonMainClassCapacity", "nonMainElectiveNumber");
                     let (chosen, which, watch) = if prefer_main {
@@ -3360,7 +3385,11 @@ pub fn main(mut args: Args) -> Result<u8, String> {
                         }
                         Some((total, used)) => format!(
                             "已满（看{which}{}：{} 个空位）",
-                            if watch { "" } else { "，首选栏没公布、退到" },
+                            if watch {
+                                ""
+                            } else {
+                                "，首选栏没公布、退到"
+                            },
                             total - used
                         ),
                     };
@@ -3543,7 +3572,14 @@ pub fn main(mut args: Args) -> Result<u8, String> {
         .enumerate()
         .map(|(i, t)| {
             (
-                school.build_wire(&code, &batch, &t.tc, &campus, t.wire_type(), t.wire_is_major()),
+                school.build_wire(
+                    &code,
+                    &batch,
+                    &t.tc,
+                    &campus,
+                    t.wire_type(),
+                    t.wire_is_major(),
+                ),
                 t.tc.clone(),
                 fire_at + i as f64 * args.stagger,
             )
@@ -3553,15 +3589,15 @@ pub fn main(mut args: Args) -> Result<u8, String> {
         info("  常驻模式：不发盲打的首发，直接进轮转（读到空位才写）");
     } else {
         info(&format!(
-        "  首发 {} 发（硬上限 3）→ {:?}{}",
-        plans.len(),
-        volley.iter().map(|t| tail(&t.tc, 3)).collect::<Vec<_>>(),
-        if plans.len() > 1 {
-            format!("，彼此错开 {:.0}ms", args.stagger * 1000.0)
-        } else {
-            String::new()
-        }
-    ));
+            "  首发 {} 发（硬上限 3）→ {:?}{}",
+            plans.len(),
+            volley.iter().map(|t| tail(&t.tc, 3)).collect::<Vec<_>>(),
+            if plans.len() > 1 {
+                format!("，彼此错开 {:.0}ms", args.stagger * 1000.0)
+            } else {
+                String::new()
+            }
+        ));
     }
 
     // 多发首发串成"上一发响应回来再发下一发"（最多多等 overlap_wait）：
@@ -3864,9 +3900,15 @@ mod tests {
             4.0,
             None,
         );
-        let wire =
-            String::from_utf8_lossy(&school.build_wire("2026000000", "B1", "TC1", "01", None, None))
-                .into_owned();
+        let wire = String::from_utf8_lossy(&school.build_wire(
+            "2026000000",
+            "B1",
+            "TC1",
+            "01",
+            None,
+            None,
+        ))
+        .into_owned();
         assert!(wire.starts_with("POST /api/elective/volunteer.do HTTP/1.1\r\n"));
         assert!(wire.contains("token: tok-abc\r\n"));
         assert!(wire.contains("Connection: keep-alive\r\n"));

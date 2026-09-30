@@ -1091,7 +1091,10 @@ impl App {
 
         let cands: Vec<Json> = cur.array("candidates").to_vec();
         if cands.is_empty() {
-            v.push(row_note("候选教学班", "（这一门还没挑 —— 按下面那行拉课程目录）"));
+            v.push(row_note(
+                "候选教学班",
+                "（这一门还没挑 —— 按下面那行拉课程目录）",
+            ));
         }
         let mut shown_group = String::new();
         for (i, item) in cands.iter().enumerate() {
@@ -2836,7 +2839,10 @@ impl App {
             self.cur = pos;
         }
         self.msg = (
-            format!("已给第 {} 门课加了候选[{idx}]：填 id / label / group", ci + 1),
+            format!(
+                "已给第 {} 门课加了候选[{idx}]：填 id / label / group",
+                ci + 1
+            ),
             Level::Warn,
         );
     }
@@ -2901,7 +2907,10 @@ impl App {
                 let n = self.raw.array("courses").len().max(1);
                 self.cur_course = (self.cur_course + 1) % n;
                 self.msg = if n == 1 {
-                    ("只有一门目标课程；要加就按「＋ 再加一门」".into(), Level::Warn)
+                    (
+                        "只有一门目标课程；要加就按「＋ 再加一门」".into(),
+                        Level::Warn,
+                    )
                 } else {
                     (
                         format!("正在编辑第 {}/{} 门课程", self.cur_course + 1, n),
@@ -2935,7 +2944,10 @@ impl App {
                     self.raw.ensure_arr("courses").remove(i);
                     self.cur_course = i.min(n - 2);
                     self.dirty = true;
-                    self.msg = (format!("已删掉第 {} 门课程（记得 s 保存）", i + 1), Level::Warn);
+                    self.msg = (
+                        format!("已删掉第 {} 门课程（记得 s 保存）", i + 1),
+                        Level::Warn,
+                    );
                 }
             }
             RowAct::Wizard => self.start_wizard(WStep::Url),
@@ -3970,7 +3982,7 @@ mod tests {
     fn adding_and_deleting_list_items() {
         let mut app = example_app();
         app.sec = 5; // 目标课程
-        // 多课程：候选挂在 courses[<当前课程>] 下
+                     // 多课程：候选挂在 courses[<当前课程>] 下
         app.add_course_cand(0);
         assert_eq!(app.raw.array("courses")[0].array("candidates").len(), 4);
         assert_eq!(

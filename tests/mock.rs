@@ -242,13 +242,12 @@ fn serve(
             json(r#"{"code":"1","data":{"token":"vt-1"}}"#)
         } else if method == "POST" && path_only.ends_with("login.do") {
             // 重排数据期间认证接口自己也是坏的 —— 这条**不消耗**重登录次数配额
-            let step = if mode == Mode::KickThenAuthBack
-                && t0.elapsed().as_secs_f64() < AUTH_BACK_AFTER
-            {
-                LoginReply::Code("#E2140600091", "认证失败")
-            } else {
-                script.lock().unwrap().pop_front().unwrap_or(LoginReply::Ok)
-            };
+            let step =
+                if mode == Mode::KickThenAuthBack && t0.elapsed().as_secs_f64() < AUTH_BACK_AFTER {
+                    LoginReply::Code("#E2140600091", "认证失败")
+                } else {
+                    script.lock().unwrap().pop_front().unwrap_or(LoginReply::Ok)
+                };
             match step {
                 LoginReply::Ok => {
                     cookies.push("JSESSIONID=S1; Path=/".to_string());
@@ -396,9 +395,13 @@ fn serve(
                 .unwrap_or_default();
             if tc.ends_with("003") {
                 // 这一栏不公布：一直 0/0
-                json(r#"{"code":"1","data":{"nonMainClassCapacity":"0","nonMainElectiveNumber":"0"}}"#)
+                json(
+                    r#"{"code":"1","data":{"nonMainClassCapacity":"0","nonMainElectiveNumber":"0"}}"#,
+                )
             } else {
-                json(r#"{"code":"1","data":{"nonMainClassCapacity":"2","nonMainElectiveNumber":"2"}}"#)
+                json(
+                    r#"{"code":"1","data":{"nonMainClassCapacity":"2","nonMainElectiveNumber":"2"}}"#,
+                )
             }
         } else if mode == Mode::AlwaysFull && path_only.ends_with("capacity.do") {
             // 一直是满的（非主选 2/2）—— 常驻轮询的常态
@@ -420,11 +423,15 @@ fn serve(
         } else if mode == Mode::OutageThenFull && path_only.ends_with("capacity.do") {
             if t0.elapsed().as_secs_f64() < OUTAGE_ENDS {
                 // 还在初始化：没有数据
-                json(r#"{"code":"1","data":{"nonMainClassCapacity":"0","nonMainElectiveNumber":"0"}}"#)
+                json(
+                    r#"{"code":"1","data":{"nonMainClassCapacity":"0","nonMainElectiveNumber":"0"}}"#,
+                )
             } else {
                 // 系统回来了，容量接口开始回真实数字 —— 但一个空位也没有。
                 // 脚本据此只会安静地只读轮询，写请求一发都不会发。
-                json(r#"{"code":"1","data":{"nonMainClassCapacity":"2","nonMainElectiveNumber":"2"}}"#)
+                json(
+                    r#"{"code":"1","data":{"nonMainClassCapacity":"2","nonMainElectiveNumber":"2"}}"#,
+                )
             }
         } else {
             json(r#"{"code":"1","data":{"campus":"01"},"dataList":[]}"#)

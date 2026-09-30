@@ -692,7 +692,11 @@ pub fn fill_reference(raw: &mut Json) -> Vec<Note> {
     }
     // 目标课程：只补"系统通用"的键；keyword / candidates 是用户自己的数据，绝不凭空造
     config::normalize_courses(raw);
-    let ref_course = reference.array("courses").first().cloned().unwrap_or(Json::Null);
+    let ref_course = reference
+        .array("courses")
+        .first()
+        .cloned()
+        .unwrap_or(Json::Null);
     for k in ["class_type", "is_major", "query_content"] {
         let has = raw
             .array("courses")
@@ -1524,7 +1528,10 @@ mod tests {
         let course = raw.array("courses")[0].clone();
         assert_eq!(course.text("keyword"), "我自己的课");
         assert_eq!(course.array("candidates").len(), 1);
-        assert!(raw.get("course").is_none(), "旧键搬家后该清掉，免得两份并存");
+        assert!(
+            raw.get("course").is_none(),
+            "旧键搬家后该清掉，免得两份并存"
+        );
         // 但缺的键还是补上了
         assert_eq!(
             raw.object("paths").unwrap().text("capacity"),

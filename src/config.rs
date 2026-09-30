@@ -677,9 +677,11 @@ mod tests {
         };
 
         // ① 老格式：一个 course 对象 → 一门课，keyword/class_type 照旧
-        let e = ep(r#","course":{"keyword":"线代","class_type":"FAWKC","is_major":"0",
+        let e = ep(
+            r#","course":{"keyword":"线代","class_type":"FAWKC","is_major":"0",
                     "candidates":[{"id":"A1","label":"A班","group":"星期三-3-5"},
-                                  ["A2","B班","星期五-3-5"]]}"#);
+                                  ["A2","B班","星期五-3-5"]]}"#,
+        );
         assert_eq!(e.courses.len(), 1);
         assert_eq!(e.courses[0].keyword, "线代");
         assert_eq!(e.courses[0].class_type, "FAWKC");
@@ -700,19 +702,27 @@ mod tests {
         assert_eq!(e.courses[1].display(), "大学物理");
         assert_eq!(e.courses[1].class_type, "FANKC");
         assert_eq!(
-            e.candidates.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            e.candidates
+                .iter()
+                .map(|c| c.id.as_str())
+                .collect::<Vec<_>>(),
             vec!["A1", "B1", "B2"]
         );
         assert_eq!(
-            e.candidates.iter().map(|c| c.course_idx).collect::<Vec<_>>(),
+            e.candidates
+                .iter()
+                .map(|c| c.course_idx)
+                .collect::<Vec<_>>(),
             vec![0, 1, 1]
         );
         // 两门课的候选落在同一个冲突组里 —— 多课程"不双选"就靠这个
         assert_eq!(e.candidates[0].group, e.candidates[1].group);
 
         // ③ 两个都有：以 courses 为准
-        let e = ep(r#","course":{"keyword":"旧的","candidates":[{"id":"OLD","group":"x"}]},
-                    "courses":[{"keyword":"新的","candidates":[{"id":"NEW","group":"y"}]}]"#);
+        let e = ep(
+            r#","course":{"keyword":"旧的","candidates":[{"id":"OLD","group":"x"}]},
+                    "courses":[{"keyword":"新的","candidates":[{"id":"NEW","group":"y"}]}]"#,
+        );
         assert_eq!(e.courses.len(), 1);
         assert_eq!(e.keyword, "新的");
         assert_eq!(e.candidates[0].id, "NEW");
