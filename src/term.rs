@@ -89,11 +89,13 @@ pub fn size() -> (usize, usize) {
 pub fn enter() -> Result<Term, String> {
     #[cfg(not(unix))]
     {
-        return Err(
+        // 这里就是整个函数的尾表达式，不要写 `return`（clippy 会判 needless_return，
+        // 而这段只在 Windows 上编进去 —— 本地和另外两个平台都看不见它）
+        Err(
             "交互式配置界面只在 Linux/macOS 上提供。Windows 请直接编辑 config.json\
              （第一次运行会在程序旁边生成一份模板）。"
                 .to_string(),
-        );
+        )
     }
     #[cfg(unix)]
     {
