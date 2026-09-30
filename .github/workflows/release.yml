@@ -1,6 +1,9 @@
 name: Release
 
-# 打 tag（v1.1.0）或手动触发，都会构建四个平台的"下载即用"包并挂到 Release 上。
+# 打 tag（v1.1.0）或手动触发，都会构建六个平台的"下载即用"包并挂到 Release 上。
+# Linux / Windows 各两个架构（x64 + arm64），macOS 按 Apple Silicon 与 Intel 分开。
+# arm64 的 runner（ubuntu-24.04-arm / windows-11-arm）只有**公开仓库**才有，
+# 本仓库是公开的；哪天改成私有，这两个平台会一直排队到超时 —— 那是唯一的失败模式。
 # 识别库（另一个仓库）会在构建时 clone 下来一起编译 —— 它是 path 依赖，
 # 编译期就并进这一个可执行文件里了。
 #
@@ -37,8 +40,13 @@ jobs:
         include:
           - os: ubuntu-latest
             asset: linux-x64
+          # arm64 runner 是原生 aarch64（不是交叉编译），cfgs 里 aarch64 走 NEON 那条路径
+          - os: ubuntu-24.04-arm
+            asset: linux-arm64
           - os: windows-latest
             asset: windows-x64
+          - os: windows-11-arm
+            asset: windows-arm64
           - os: macos-15-intel  # Intel（macos-13 已被 GitHub 退役）
             asset: macos-x64
           - os: macos-14        # Apple Silicon
@@ -71,7 +79,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $Tag = "windows-x64"
+          $Tag = "${{ matrix.asset }}"
           $Out = "dist/course-grabber-$Tag"
           Remove-Item -Recurse -Force $Out -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Path $Out | Out-Null

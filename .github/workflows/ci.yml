@@ -18,7 +18,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        # 发布要覆盖到 arm64（linux-arm64 / windows-arm64），这里就得跟着编、跟着跑测试 ——
+        # 否则某个平台第一次被编译，就是发版那一刻。macos-latest 是 Apple Silicon；
+        # macos-x64（Intel）目前只在 release 里编，CI 这一列还没覆盖它。
+        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, windows-11-arm, macos-latest]
     steps:
       - uses: actions/checkout@v4
 
@@ -43,7 +46,17 @@ jobs:
 
   build-smoke:
     name: 打包冒烟（真实构建 + 产物自检）
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # 打包脚本的 TAG 是从 uname 推出来的，所以换台机器就该是 linux-arm64 ——
+        # 这条正是在验"同一个脚本在 arm64 上产出的包名和内容都对"
+        include:
+          - os: ubuntu-latest
+            asset: linux-x64
+          - os: ubuntu-24.04-arm
+            asset: linux-arm64
     steps:
       - uses: actions/checkout@v4
 
@@ -59,7 +72,7 @@ jobs:
         shell: bash
         run: |
           set -e
-          cd dist/course-grabber-linux-x64
+          cd dist/course-grabber-${{ matrix.asset }}
           ./course-grabber --version
           cp config.example.json config.json
           # 不要把输出直接管给 head —— 那会让进程吃到 SIGPIPE（虽然我们已经把它设回默认，
@@ -72,7 +85,7 @@ jobs:
         shell: bash
         run: |
           set -e
-          size=$(stat -c %s dist/course-grabber-linux-x64/course-grabber)
+          size=$(stat -c %s dist/course-grabber-${{ matrix.asset }}/course-grabber)
           echo "可执行文件 $((size / 1024)) KB"
           # 下界：识别模型 124KB + 推理代码，小于 500KB 说明模型没编进去
           [ "$size" -gt 500000 ] || { echo "✗ 太小了，识别模型大概没编进去"; exit 1; }

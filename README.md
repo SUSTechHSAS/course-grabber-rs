@@ -56,6 +56,10 @@
 run.bat           # Windows（双击）
 ```
 
+包名是 `course-grabber-<平台>.tar.gz`（Linux）或 `.zip`（Windows / macOS），平台有六个：
+`linux-x64`、`linux-arm64`、`windows-x64`、`windows-arm64`、`macos-x64`（Intel）、
+`macos-arm64`（Apple Silicon）。`SHA256SUMS.txt` 里是各自的校验和。
+
 第一次运行会在可执行文件旁边生成 `config.json` 并告诉你该填什么。
 想少填点就直接 `./course-grabber tui` —— 里面有个配置向导（四步），粘一条选课页网址就能把
 "学校"那一节填好，见下面「配置界面」。
